@@ -1,0 +1,351 @@
+id          = "email-processing"
+name        = "Email Processing Hand"
+description = "Classifies, monitors, and processes incoming email across MS365 + IMAP accounts. Backlog (interactive training) and incremental (autonomous) modes. Generates per-project digests, raises urgent alerts, and synthesizes Sieve scripts on the IMAP server."
+category    = "productivity"
+icon        = "\U0001F4E7"
+
+# ─── Tools, skills, MCP servers ──────────────────────────────────────────────
+
+tools = [
+    "memory_store",
+    "memory_recall",
+    "schedule_create",
+    "schedule_list",
+    "schedule_delete",
+    "event_publish",
+    "shell_exec",
+]
+skills = []
+# rustymail covers IMAP fetch + ManageSieve. ms365 covers the work account.
+# slack handles urgent alerts. mcp-atlassian is for project-list bootstrap.
+# All four must be configured in ~/.openfang/config.toml. Skeleton tolerates
+# missing servers (logs + degrades) — they're only required as features land.
+mcp_servers = ["rustymail", "ms365", "slack", "mcp-atlassian"]
+
+# ─── Settings (v1 surface from design §11) ───────────────────────────────────
+#
+# These are loaded into the agent's runtime context. Adjust via the OpenFang
+# dashboard. Skeleton wires the values through but only some affect behavior
+# yet; the rest are placeholders for upcoming slices.
+
+[[settings]]
+key          = "processing_mode"
+label        = "Processing mode"
+description  = "Skeleton starts in 'paused' so nothing happens until you flip to incremental."
+setting_type = "select"
+default      = "paused"
+
+[[settings.options]]
+value = "incremental"
+label = "Incremental (autonomous, scheduled)"
+
+[[settings.options]]
+value = "backlog"
+label = "Backlog (interactive training only)"
+
+[[settings.options]]
+value = "paused"
+label = "Paused (no scheduled processing)"
+
+[[settings]]
+key          = "incremental_interval_minutes"
+label        = "Incremental tick interval"
+description  = "How often to scan for new mail when processing_mode = incremental."
+setting_type = "select"
+default      = "5"
+
+[[settings.options]]
+value = "1"
+label = "Every minute (debugging)"
+
+[[settings.options]]
+value = "5"
+label = "Every 5 minutes (default)"
+
+[[settings.options]]
+value = "15"
+label = "Every 15 minutes"
+
+[[settings.options]]
+value = "60"
+label = "Every hour"
+
+[[settings]]
+key          = "digest_send_time"
+label        = "Daily digest send time (local)"
+description  = "When to dispatch the daily project digests. 24-hour HH:MM."
+setting_type = "text"
+default      = "07:00"
+
+[[settings]]
+key          = "digest_timezone"
+label        = "Digest timezone (IANA)"
+description  = "Timezone for digest_send_time (e.g. America/Chicago)."
+setting_type = "text"
+default      = "America/Chicago"
+
+[[settings]]
+key          = "user_domains"
+label        = "Your own domains (comma-separated)"
+description  = "Used to distinguish 'us' from 'them' when resolving project ownership of a thread."
+setting_type = "text"
+default      = "scalesology.com,bruggerink.com,fait.app"
+
+[[settings]]
+key          = "vip_senders"
+label        = "VIP senders (comma-separated emails)"
+description  = "Mail from these addresses bypasses classification and routes straight to the urgent channel."
+setting_type = "text"
+default      = ""
+
+[[settings]]
+key          = "urgent_alert_channel"
+label        = "Urgent alert channel"
+description  = "Where to deliver Bucket 11 / Bucket 12 alerts. Falls back to event bus if the chosen channel is unreachable."
+setting_type = "select"
+default      = "event"
+
+[[settings.options]]
+value = "slack"
+label = "Slack (urgent_alert_target = channel/DM id)"
+
+[[settings.options]]
+value = "keybase"
+label = "Keybase (deferred)"
+
+[[settings.options]]
+value = "email"
+label = "Email-to-self"
+
+[[settings.options]]
+value = "event"
+label = "OpenFang event bus only"
+
+[[settings]]
+key          = "urgent_alert_target"
+label        = "Urgent alert target id"
+description  = "Channel id, DM target, or address — interpretation depends on urgent_alert_channel."
+setting_type = "text"
+default      = ""
+
+[[settings]]
+key          = "classification_confidence_high"
+label        = "High-confidence threshold"
+description  = "≥ this confidence executes the bucket action immediately."
+setting_type = "text"
+default      = "0.85"
+
+[[settings]]
+key          = "classification_confidence_medium"
+label        = "Medium-confidence threshold"
+description  = "≥ medium but < high also acts but flags the message in the digest spot-check."
+setting_type = "text"
+default      = "0.60"
+
+[[settings]]
+key          = "max_messages_per_tick"
+label        = "Max messages per tick"
+description  = "Hard cap per account per incremental cycle."
+setting_type = "text"
+default      = "50"
+
+[[settings]]
+key          = "max_novel_classifications_per_tick"
+label        = "Max novel classifications per tick"
+description  = "Cap on classifier LLM calls per account per cycle. Excess defers to the next tick."
+setting_type = "text"
+default      = "10"
+
+[[settings]]
+key          = "max_digest_summary_calls_per_tick"
+label        = "Max digest summary LLM calls per tick"
+description  = "Cap on rich-summary generations per cycle."
+setting_type = "text"
+default      = "30"
+
+[[settings]]
+key          = "sieve_enabled"
+label        = "Enable Sieve regeneration on IMAP accounts"
+description  = "When true, deterministic rules are pushed to a managed Sieve script via rustymail's sieve_* tools."
+setting_type = "toggle"
+default      = "true"
+
+[[settings]]
+key          = "sieve_managed_script_name"
+label        = "Sieve managed script name"
+description  = "Name of the Sieve script the hand owns. The hand never edits scripts it didn't create."
+setting_type = "text"
+default      = "openfang-managed.sieve"
+
+[[settings]]
+key          = "blacklist_require_confirmation"
+label        = "Require confirmation for Blacklist actions"
+description  = "Prompts via dashboard chat before deleting historical mail from a blacklisted sender."
+setting_type = "toggle"
+default      = "false"
+
+[[settings]]
+key          = "unsubscribe_lookback_months"
+label        = "Unsubscribe lookback months"
+description  = "How far back to look for active mailing lists when handling Bucket 2 (Unsubscribe and Block)."
+setting_type = "text"
+default      = "4"
+
+[[settings]]
+key          = "informational_inbox_retention_days"
+label        = "Informational inbox retention (days)"
+description  = "Auto-archive Bucket 9 messages still in the inbox after this many days."
+setting_type = "text"
+default      = "14"
+
+[[settings]]
+key          = "skip_inbox_retention_days"
+label        = "Skip-bucket retention (days)"
+description  = "Re-prompt for classification of Bucket 13 messages still in the inbox after this many days."
+setting_type = "text"
+default      = "7"
+
+# ─── Dashboard metrics ───────────────────────────────────────────────────────
+
+[dashboard]
+
+[[dashboard.metrics]]
+label      = "Last incremental run"
+memory_key = "email_metrics_last_run"
+format     = "text"
+
+[[dashboard.metrics]]
+label      = "Health"
+memory_key = "email_metrics_health"
+format     = "text"
+
+[[dashboard.metrics]]
+label      = "Messages classified today"
+memory_key = "email_metrics_classified_today"
+format     = "number"
+
+[[dashboard.metrics]]
+label      = "Auto-handled today"
+memory_key = "email_metrics_auto_handled_today"
+format     = "number"
+
+[[dashboard.metrics]]
+label      = "Awaiting your reply"
+memory_key = "email_metrics_awaiting_reply"
+format     = "number"
+
+[[dashboard.metrics]]
+label      = "Rules learned (lifetime)"
+memory_key = "email_metrics_rules_learned"
+format     = "number"
+
+# ─── Agent configuration ─────────────────────────────────────────────────────
+
+[agent]
+name                    = "email-processing-hand"
+description             = "Classifies and processes incoming email across two accounts; manages Sieve filters and project digests."
+module                  = "builtin:chat"
+provider                = "default"
+model                   = "default"
+max_tokens              = 32768
+temperature             = 0.1
+max_iterations          = 80
+heartbeat_interval_secs = 120
+schedule_mode           = "reactive"
+system_prompt = """You are Email Processing Hand — an autonomous worker that classifies, monitors, and processes incoming email. You run in two modes:
+
+- **Incremental** (autonomous, scheduled): scan new mail, classify, act per the routing buckets in your design doc.
+- **Backlog** (interactive, dashboard chat): walk the user through training rounds, learning per-sender rules from confirmation/correction.
+
+You are CURRENTLY RUNNING IN SKELETON MODE. The dispatch wiring is in place but the per-bucket handlers, sidecar, and Sieve regeneration are not yet implemented. For now, every tick records that it ran and exits cleanly. Do NOT attempt to fetch, classify, modify, or send mail until the relevant handlers ship.
+
+## MCP Servers
+
+You have these MCP servers configured (skeleton tolerates missing ones — log and continue):
+
+- **rustymail** — IMAP fetch (mail-listing tools) AND ManageSieve (sieve_* tools).
+- **ms365** — Microsoft Graph for the work account.
+- **slack** — urgent alert delivery.
+- **mcp-atlassian** — Jira project list bootstrap; v2 ticketing.
+
+## CRITICAL RULES
+
+1. **Skeleton mode**: do not perform any email I/O. Logging + memory_store + schedule management only.
+2. **All external API calls go through MCP tools.** Never use shell_exec for HTTP / IMAP / Graph.
+3. **Idempotency**: every persistent write MUST be safe to repeat. Cursors update only at end of cycle.
+4. **Convert relative dates** in messages to absolute YYYY-MM-DD before storing in memory.
+
+## Phase 0 — State recovery
+
+On every wake-up:
+
+1. memory_recall `email_bootstrap_progress` — if absent, treat as a fresh install and record `{ "step": 0, "completed_steps": [], "started_at": "<now>" }`.
+2. memory_recall `email_processing_state` — last run metadata: { last_run_iso, last_run_outcome, last_tick_kind }.
+3. Read user-configured settings: processing_mode, incremental_interval_minutes, digest_send_time, digest_timezone, urgent_alert_channel, urgent_alert_target.
+
+## Phase 1 — Schedule setup (idempotent every tick)
+
+Call schedule_list. Ensure the following schedules exist; create any that are missing.
+
+| Schedule name                     | Interval                                                | Trigger message              |
+|-----------------------------------|---------------------------------------------------------|------------------------------|
+| `email-incremental-tick`          | `interval_minutes = <incremental_interval_minutes>`     | `tick: incremental`          |
+| `email-daily-digest-tick`         | `interval_minutes = 1440`, note `<digest_send_time> daily` | `tick: daily-digest`      |
+| `email-contacts-refresh-tick`     | `interval_minutes = 1440`, note `03:00 daily`           | `tick: contacts-refresh`     |
+
+If `processing_mode = paused`, delete any existing schedules and skip Phase 2 entirely. The hand stays installed but does no scheduled work.
+
+If `incremental_interval_minutes` has changed since the last tick, delete the existing `email-incremental-tick` schedule and recreate it.
+
+## Phase 2 — Tick dispatch
+
+Examine the **first message** of the conversation:
+
+- If it starts with `tick: incremental` → call `incremental_cycle()` (skeleton no-op below).
+- If it starts with `tick: daily-digest` → call `daily_digest_cycle()` (skeleton no-op below).
+- If it starts with `tick: contacts-refresh` → call `contacts_refresh_cycle()` (skeleton no-op below).
+- Otherwise → conversational mode (skeleton: explain that interactive flows are not implemented yet and exit).
+
+### incremental_cycle (skeleton)
+
+1. Log `email_classification_decision`-style event_publish with `{ "skeleton": true, "tick_kind": "incremental", "message_count_processed": 0 }`.
+2. memory_store `email_processing_state` with `{ last_run_iso: <now>, last_run_outcome: "skeleton-noop", last_tick_kind: "incremental" }`.
+3. memory_store `email_metrics_last_run` with the ISO timestamp (dashboard widget reads this).
+4. memory_store `email_metrics_health` with `"skeleton: incremental tick OK"`.
+5. Exit cleanly. Do NOT touch any MCP server.
+
+### daily_digest_cycle (skeleton)
+
+1. Log a marker event as above with `tick_kind: "daily-digest"`.
+2. memory_store `email_metrics_last_run`, `email_metrics_health` (`"skeleton: digest tick OK"`).
+3. Exit.
+
+### contacts_refresh_cycle (skeleton)
+
+1. Log a marker event as above with `tick_kind: "contacts-refresh"`.
+2. memory_store `email_metrics_health` with `"skeleton: contacts tick OK"`.
+3. Exit.
+
+### Conversational mode (skeleton)
+
+If the message doesn't start with `tick:`, treat it as user input from the dashboard chat. In skeleton mode, respond with:
+
+> "I'm Email Processing Hand, currently in skeleton mode. The dispatch and scheduling wiring is in place, but the per-bucket handlers, Python sidecar, and Sieve regeneration aren't implemented yet. Once those land you'll be able to ask me to run a backlog session, query the digest queue, or correct yesterday's classifications."
+
+Then exit. Do NOT attempt any classification, MCP call, or memory mutation in this branch.
+
+## Health and observability
+
+Every cycle (tick or conversational), publish exactly ONE `email_cycle_complete` event with:
+
+```json
+{
+  "skeleton": true,
+  "tick_kind": "<incremental|daily-digest|contacts-refresh|conversational>",
+  "ran_at": "<iso>",
+  "outcome": "skeleton-noop"
+}
+```
+
+Future slices will replace these no-op handlers with the real Phase 1–5 logic from the design doc (see `docs/design.md` in the hand repo).
+"""

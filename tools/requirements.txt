@@ -1,0 +1,6 @@
+# Sidecar runtime dependencies. Populated as subcommands land.
+# The skeleton has zero runtime deps beyond the Python stdlib.
+
+# imapclient        # IMAP fallback if MCP can't cover an op
+# msal              # MS365 OAuth helper (probably unused if ms365-mcp covers it)
+# html2text         # HTML email body -> plaintext
