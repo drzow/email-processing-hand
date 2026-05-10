@@ -49,16 +49,61 @@ def test_planned_subcommands_return_not_implemented_error() -> None:
     # Each subcommand declared in scan._PLANNED should exit cleanly with a
     # structured "not_implemented" error envelope rather than crashing.
     for name in (
-        "fetch-batch",
         "rank-senders",
-        "resolve-domain",
         "parse-thread",
         "parse-feedback-reply",
+        "contacts-bootstrap",
     ):
         env = run_scan(name)
         assert env["status"] == "error", f"{name}: expected error status, got {env}"
         assert env["error"]["code"] == "not_implemented"
         assert name in env["error"]["message"]
+
+
+# ---------- resolve-domain (full subcommand integration) ----------------
+
+
+def test_resolve_domain_returns_matched_project_for_known_domain() -> None:
+    env = run_scan(
+        "resolve-domain",
+        {
+            "from": [{"name": "Sam", "addr": "sam@acme.com"}],
+            "to": [{"name": "Me", "addr": "me@scalesology.com"}],
+            "cc": [],
+            "user_domains": ["scalesology.com"],
+            "exclude_domains": [],
+            "project_map": {"acme.com": "Acme"},
+        },
+    )
+    assert env["status"] == "ok", env
+    assert env["result"]["matched_project"] == "Acme"
+    assert env["result"]["ranked_domains"][0]["domain"] == "acme.com"
+    assert env["metrics"]["domains_ranked"] == 1
+
+
+def test_resolve_domain_handles_unmapped_addresses() -> None:
+    env = run_scan(
+        "resolve-domain",
+        {
+            "from": [{"name": "", "addr": "rep@unknown.com"}],
+            "to": [],
+            "cc": [],
+            "user_domains": [],
+            "exclude_domains": [],
+            "project_map": {"acme.com": "Acme"},
+        },
+    )
+    assert env["status"] == "ok"
+    assert env["result"]["matched_project"] is None
+    assert env["result"]["ranked_domains"][0]["domain"] == "unknown.com"
+
+
+def test_resolve_domain_with_empty_input_is_ok() -> None:
+    env = run_scan("resolve-domain", {})
+    assert env["status"] == "ok"
+    assert env["result"]["matched_project"] is None
+    assert env["result"]["ranked_domains"] == []
+    assert "no addresses" in " ".join(env["result"]["decision_trace"]).lower()
 
 
 def test_unknown_subcommand_is_rejected_by_argparse() -> None:
