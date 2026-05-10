@@ -103,6 +103,43 @@ def _handle(req: dict) -> None:
         if name == "raise_error":
             _error(req_id, args.get("code", -32603), args.get("message", "boom"))
             return
+        if name == "search_by_sender":
+            # Canned hits for marketing@vendor.com, otherwise empty.
+            if args.get("value") == "marketing@vendor.com":
+                hits = [
+                    {
+                        "uid": 100,
+                        "folder": "INBOX",
+                        "subject": "May sale",
+                        "from": "marketing@vendor.com",
+                        "date": "Mon, 01 Apr 2026 09:30:00 -0500",
+                        "size_bytes": 11000,
+                    },
+                    {
+                        "uid": 101,
+                        "folder": "INBOX",
+                        "subject": "April sale",
+                        "from": "marketing@vendor.com",
+                        "date": "Sun, 01 Mar 2026 09:30:00 -0500",
+                        "size_bytes": 12000,
+                    },
+                    {
+                        "uid": 102,
+                        "folder": "Archive",
+                        "subject": "March sale",
+                        "from": "marketing@vendor.com",
+                        "date": "Wed, 01 Feb 2026 09:30:00 -0500",
+                        "size_bytes": 9000,
+                    },
+                ]
+            else:
+                hits = []
+            payload = {"matches": hits, "total": len(hits)}
+            _result(
+                req_id,
+                {"content": [{"type": "text", "text": json.dumps(payload)}]},
+            )
+            return
         if name == "get_email_by_uid":
             uid = int(args.get("uid", 0))
             raw = CANNED_MESSAGES.get(uid)

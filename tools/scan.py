@@ -130,6 +130,69 @@ def _resolve_domain(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# classify-context — bundle everything the LLM classifier needs about one
+# message: parsed headers, body, project resolution, cheap signals.
+# ---------------------------------------------------------------------------
+
+
+@register("classify-context")
+def _classify_context(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.domain import resolve
+    from lib.headers import classification_set
+    from lib.signals import all_signals
+
+    msg = request.get("message")
+    if not msg:
+        raise SidecarError("bad_request", "message field is required")
+
+    # Accept either a raw RFC 5322 string OR a pre-shaped fetch-batch entry.
+    raw = msg.get("raw") or ""
+    if "headers" in msg and msg["headers"]:
+        headers = msg["headers"]
+        body_text = msg.get("body_text", "")
+    else:
+        if not raw:
+            raise SidecarError(
+                "bad_request", "message needs either 'raw' or 'headers'"
+            )
+        headers = classification_set(raw)
+        body_text = _split_body(raw)
+
+    ranking = resolve(
+        from_=headers.get("from", []),
+        to=headers.get("to", []),
+        cc=headers.get("cc", []),
+        user_domains=request.get("user_domains", []),
+        exclude_domains=request.get("exclude_domains", []),
+        project_map=request.get("project_map", {}),
+    )
+    signals = all_signals(
+        raw_message=raw,
+        headers=headers,
+        vips=request.get("vip_senders", []),
+        contacts=request.get("contacts", {}),
+        user_domains=request.get("user_domains", []),
+    )
+
+    result = {
+        "headers": headers,
+        "body_text": body_text,
+        "matched_project": ranking["matched_project"],
+        "ranked_domains": ranking["ranked_domains"],
+        "decision_trace": ranking["decision_trace"],
+        "signals": signals,
+    }
+    return (
+        result,
+        {
+            "messages_scanned": 1,
+            "mcp_calls": 0,
+            "result_bytes": len(body_text),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # fetch-batch — fetch + parse + render a batch of messages by uid.
 # v1 supports selector.kind == "uids" only. The agent passes the
 # rustymail / ms365 mcp_server config in the request so this slice
@@ -246,6 +309,113 @@ def _shape_message(
     }
 
 
+# ---------------------------------------------------------------------------
+# prepare-bulk-delete — dry-run scan for messages matching a selector.
+# Returns count + folder list + samples + estimated storage. NEVER
+# deletes anything; the actual delete is the agent's responsibility
+# after explicit user confirmation.
+# ---------------------------------------------------------------------------
+
+
+_BULK_DELETE_SELECTORS = {"from_sender", "from_domain", "list_id"}
+
+
+@register("prepare-bulk-delete")
+def _prepare_bulk_delete(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.mcp_client import McpClient, McpClientError
+
+    server_cfg = request.get("mcp_server")
+    if not server_cfg or "command" not in server_cfg:
+        raise SidecarError("bad_request", "mcp_server.command is required")
+    selector = request.get("selector") or {}
+    kind = selector.get("kind")
+    if kind not in _BULK_DELETE_SELECTORS:
+        raise SidecarError(
+            "bad_request",
+            f"selector.kind must be one of {sorted(_BULK_DELETE_SELECTORS)}; got {kind!r}",
+        )
+
+    search_tool = request.get("search_tool", "search_by_sender")
+    search_args = dict(request.get("search_args") or {})
+    search_args.setdefault("value", selector.get("value", ""))
+    search_args.setdefault("scope", request.get("scope", "inbox"))
+    sample_size = int(request.get("sample_size", 5))
+
+    client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
+    try:
+        client.open()
+        try:
+            tool_result = client.call_tool(search_tool, search_args)
+        except McpClientError as e:
+            raise SidecarError("mcp_error", str(e)) from e
+    finally:
+        client.close()
+
+    payload = _extract_payload(tool_result)
+    matches = payload.get("matches") if isinstance(payload, dict) else None
+    if matches is None:
+        # Some servers return the list at the top level.
+        matches = payload if isinstance(payload, list) else []
+
+    folders: set[str] = set()
+    total_bytes = 0
+    samples: list[dict[str, Any]] = []
+    for entry in matches:
+        folder = entry.get("folder", "INBOX")
+        folders.add(folder)
+        total_bytes += int(entry.get("size_bytes") or 0)
+        if len(samples) < sample_size:
+            samples.append(
+                {
+                    "uid": entry.get("uid"),
+                    "folder": folder,
+                    "subject": entry.get("subject"),
+                    "from": entry.get("from"),
+                    "date": entry.get("date"),
+                }
+            )
+
+    return (
+        {
+            "dry_run": True,
+            "selector": selector,
+            "match_count": len(matches),
+            "folders": sorted(folders),
+            "samples": samples,
+            "estimated_storage_freed_bytes": total_bytes,
+        },
+        {
+            "messages_scanned": len(matches),
+            "mcp_calls": 1,
+            "result_bytes": 0,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# parse-ical — extract VEVENT fields from an iCalendar blob (no MCP).
+# ---------------------------------------------------------------------------
+
+
+@register("parse-ical")
+def _parse_ical(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.ical import parse
+
+    text = request.get("ical_text")
+    if text is None:
+        raise SidecarError("bad_request", "ical_text field is required")
+    result = parse(text)
+    return (
+        result,
+        {
+            "messages_scanned": 0,
+            "mcp_calls": 0,
+            "result_bytes": 0,
+            "events_parsed": len(result["events"]),
+        },
+    )
+
+
 def _split_body(raw: str) -> str:
     """Split RFC 5322 message into header/body and return the body."""
     if not raw:
@@ -265,10 +435,8 @@ _PLANNED = [
     "contacts-refresh",
     "rank-senders",
     "parse-thread",
-    "prepare-bulk-delete",
     "parse-feedback-reply",
     "submit-unsubscribe",
-    "parse-ical",
 ]
 
 for _name in _PLANNED:
