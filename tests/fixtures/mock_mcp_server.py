@@ -45,6 +45,100 @@ CANNED_MESSAGES: dict[int, str] = {
 }
 
 
+# Folder listings for rank-senders tests. Each "message" carries enough
+# metadata to aggregate by sender without a separate fetch.
+FOLDER_MESSAGES: dict[str, list[dict]] = {
+    "INBOX": [
+        {
+            "uid": 10,
+            "from": "Marketing Bot <marketing@vendor.com>",
+            "subject": "May sale",
+            "date": "2026-05-01T09:00:00Z",
+            "size_bytes": 11000,
+        },
+        {
+            "uid": 11,
+            "from": "Marketing Bot <marketing@vendor.com>",
+            "subject": "April sale",
+            "date": "2026-04-15T09:00:00Z",
+            "size_bytes": 12000,
+        },
+        {
+            "uid": 12,
+            "from": "marketing@vendor.com",  # no display name
+            "subject": "Mid-April special",
+            "date": "2026-04-10T09:00:00Z",
+            "size_bytes": 10000,
+        },
+        {
+            "uid": 13,
+            "from": "Sam Long <sam@acme.com>",
+            "subject": "Q3 plan questions",
+            "date": "2026-05-02T10:00:00Z",
+            "size_bytes": 5000,
+        },
+        {
+            "uid": 14,
+            "from": "Sam Long <sam@acme.com>",
+            "subject": "Re: Q3 plan",
+            "date": "2026-05-03T10:00:00Z",
+            "size_bytes": 5200,
+        },
+        {
+            "uid": 15,
+            "from": "alice@scalesology.com",  # self
+            "subject": "Note to self",
+            "date": "2026-05-04T11:00:00Z",
+            "size_bytes": 800,
+        },
+    ],
+    "Archive": [
+        {
+            "uid": 100,
+            "from": "marketing@vendor.com",
+            "subject": "March sale",
+            "date": "2026-03-15T09:00:00Z",
+            "size_bytes": 9500,
+        },
+        {
+            "uid": 101,
+            "from": "marketing@vendor.com",
+            "subject": "Feb sale",
+            "date": "2026-02-15T09:00:00Z",
+            "size_bytes": 9200,
+        },
+        {
+            "uid": 102,
+            "from": "marketing@vendor.com",
+            "subject": "Jan sale",
+            "date": "2026-01-15T09:00:00Z",
+            "size_bytes": 9100,
+        },
+        {
+            "uid": 103,
+            "from": "marketing@vendor.com",
+            "subject": "Holiday sale",
+            "date": "2025-12-15T09:00:00Z",
+            "size_bytes": 9300,
+        },
+        {
+            "uid": 104,
+            "from": "marketing@vendor.com",
+            "subject": "Black Friday",
+            "date": "2025-11-26T09:00:00Z",
+            "size_bytes": 9400,
+        },
+        {
+            "uid": 200,
+            "from": "Boss Person <boss@acme.com>",
+            "subject": "Year end review",
+            "date": "2025-12-20T15:00:00Z",
+            "size_bytes": 6000,
+        },
+    ],
+}
+
+
 def _send(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
@@ -102,6 +196,38 @@ def _handle(req: dict) -> None:
             return
         if name == "raise_error":
             _error(req_id, args.get("code", -32603), args.get("message", "boom"))
+            return
+        if name == "list_folders":
+            _result(
+                req_id,
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"folders": sorted(FOLDER_MESSAGES.keys())}
+                            ),
+                        }
+                    ]
+                },
+            )
+            return
+        if name == "list_emails_in_folder":
+            folder = args.get("folder", "INBOX")
+            messages = FOLDER_MESSAGES.get(folder, [])
+            _result(
+                req_id,
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"messages": messages, "total": len(messages)}
+                            ),
+                        }
+                    ]
+                },
+            )
             return
         if name == "search_by_sender":
             # Canned hits for marketing@vendor.com, otherwise empty.

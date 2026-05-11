@@ -310,6 +310,194 @@ def _shape_message(
 
 
 # ---------------------------------------------------------------------------
+# rank-senders — aggregate by sender across one or more folders, sort by
+# count or volume. Powers backlog mode's "top senders by count/volume"
+# workflows. No fetch of message bodies — only header-derivable fields.
+# ---------------------------------------------------------------------------
+
+
+_RANK_METRICS = {"count", "volume"}
+
+
+@register("rank-senders")
+def _rank_senders(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.headers import parse_address_list
+    from lib.mcp_client import McpClient, McpClientError
+
+    server_cfg = request.get("mcp_server")
+    if not server_cfg or "command" not in server_cfg:
+        raise SidecarError("bad_request", "mcp_server.command is required")
+
+    metric = request.get("metric", "count")
+    if metric not in _RANK_METRICS:
+        raise SidecarError(
+            "bad_request",
+            f"metric must be one of {sorted(_RANK_METRICS)}; got {metric!r}",
+        )
+
+    list_tool = request.get("list_tool", "list_emails_in_folder")
+    list_tool_args = request.get("list_tool_args") or {}
+    list_folders_tool = request.get("list_folders_tool", "list_folders")
+    limit = int(request.get("limit", 50))
+    sample_subjects_max = int(request.get("sample_subjects_max", 3))
+    cutoff = request.get("exclude_already_processed_until")
+
+    folders = _resolve_folders(request)
+
+    client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
+    aggregated: dict[str, dict[str, Any]] = {}
+    messages_scanned = 0
+    messages_excluded = 0
+    mcp_calls = 0
+
+    try:
+        client.open()
+        # If caller asked for "all_folders" without an explicit list,
+        # discover them via list_folders_tool.
+        if folders is None:
+            mcp_calls += 1
+            try:
+                folder_result = client.call_tool(list_folders_tool, {})
+            except McpClientError as e:
+                raise SidecarError("mcp_error", str(e)) from e
+            payload = _extract_payload(folder_result)
+            folders = payload.get("folders") if isinstance(payload, dict) else None
+            if not folders:
+                folders = []
+
+        for folder in folders:
+            mcp_calls += 1
+            args = dict(list_tool_args)
+            args["folder"] = folder
+            try:
+                tool_result = client.call_tool(list_tool, args)
+            except McpClientError as e:
+                raise SidecarError("mcp_error", str(e)) from e
+            payload = _extract_payload(tool_result)
+            entries = (
+                payload.get("messages") if isinstance(payload, dict) else None
+            ) or (payload if isinstance(payload, list) else [])
+            for entry in entries:
+                messages_scanned += 1
+                if cutoff and (entry.get("date") or "") <= cutoff:
+                    messages_excluded += 1
+                    continue
+                _accumulate(aggregated, entry, folder, parse_address_list)
+    finally:
+        client.close()
+
+    ranking = _finalize_ranking(aggregated, metric, limit, sample_subjects_max)
+    return (
+        {
+            "ranking": ranking,
+            "scan_summary": {
+                "folders_scanned": folders,
+                "messages_scanned": messages_scanned,
+                "messages_excluded": messages_excluded,
+                "unique_senders": len(aggregated),
+                "metric": metric,
+            },
+        },
+        {
+            "messages_scanned": messages_scanned,
+            "mcp_calls": mcp_calls,
+            "result_bytes": 0,
+        },
+    )
+
+
+def _resolve_folders(request: dict[str, Any]) -> list[str] | None:
+    """Return an explicit folder list, or None to mean 'discover via tool'."""
+    explicit = request.get("folders")
+    if explicit:
+        return list(explicit)
+    scope = request.get("scope")
+    if scope == "inbox":
+        return ["INBOX"]
+    if scope == "all_folders" or scope is None:
+        return None  # discover via list_folders_tool
+    raise SidecarError(
+        "bad_request",
+        f"scope must be 'inbox', 'all_folders', or a folders list; got {scope!r}",
+    )
+
+
+def _accumulate(
+    aggregated: dict[str, dict[str, Any]],
+    entry: dict[str, Any],
+    folder: str,
+    parse_address_list: Any,
+) -> None:
+    """Add one message entry into the per-sender aggregation."""
+    raw_from = entry.get("from") or ""
+    addrs = parse_address_list(raw_from)
+    if not addrs:
+        return
+    addr = addrs[0]["addr"]
+    name = addrs[0]["name"]
+
+    bucket = aggregated.setdefault(
+        addr,
+        {
+            "sender": addr,
+            "name": name,  # first observation wins (overwritten below if blank)
+            "message_count": 0,
+            "total_bytes": 0,
+            "sample_subjects": [],
+            "subject_seen": set(),
+            "oldest": None,
+            "newest": None,
+            "folders": set(),
+        },
+    )
+    if not bucket["name"] and name:
+        bucket["name"] = name
+
+    bucket["message_count"] += 1
+    bucket["total_bytes"] += int(entry.get("size_bytes") or 0)
+    subj = entry.get("subject") or ""
+    if subj and subj not in bucket["subject_seen"]:
+        bucket["subject_seen"].add(subj)
+        bucket["sample_subjects"].append(subj)
+    date = entry.get("date") or ""
+    if date:
+        if bucket["oldest"] is None or date < bucket["oldest"]:
+            bucket["oldest"] = date
+        if bucket["newest"] is None or date > bucket["newest"]:
+            bucket["newest"] = date
+    bucket["folders"].add(folder)
+
+
+def _finalize_ranking(
+    aggregated: dict[str, dict[str, Any]],
+    metric: str,
+    limit: int,
+    sample_subjects_max: int,
+) -> list[dict[str, Any]]:
+    """Sort + slice + serialize."""
+    key = "message_count" if metric == "count" else "total_bytes"
+    rows = sorted(
+        aggregated.values(),
+        key=lambda b: (-b[key], b["sender"]),
+    )[:limit]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "sender": r["sender"],
+                "name": r["name"],
+                "message_count": r["message_count"],
+                "total_bytes": r["total_bytes"],
+                "sample_subjects": r["sample_subjects"][:sample_subjects_max],
+                "oldest": r["oldest"],
+                "newest": r["newest"],
+                "folders": sorted(r["folders"]),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # prepare-bulk-delete — dry-run scan for messages matching a selector.
 # Returns count + folder list + samples + estimated storage. NEVER
 # deletes anything; the actual delete is the agent's responsibility
@@ -433,7 +621,6 @@ def _split_body(raw: str) -> str:
 _PLANNED = [
     "contacts-bootstrap",
     "contacts-refresh",
-    "rank-senders",
     "parse-thread",
     "parse-feedback-reply",
     "submit-unsubscribe",
