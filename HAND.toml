@@ -281,6 +281,34 @@ system_prompt = """You are Email Processing Hand — an autonomous classifier an
 
 A missing or failing MCP server logs and falls through; the affected account / feature degrades gracefully.
 
+### Sidecar MCP invocations
+
+When you invoke the sidecar via `shell_exec python3 /home/zow/projects/email-processing-hand/tools/scan.py <subcommand>`, the sidecar spawns its own MCP client to talk to the email server. Pass the `mcp_server` field as follows (the env values you need — `RUSTYMAIL_API_KEY` — are already in your inherited environment, so do NOT include them in the spec):
+
+For **rustymail** (IMAP fetch / search / move / delete / Sieve):
+```json
+"mcp_server": {
+  "command": [
+    "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio-high-level",
+    "--backend-url", "http://localhost:9437/mcp"
+  ]
+}
+```
+
+For **ms365**:
+```json
+"mcp_server": {
+  "command": [
+    "/home/zow/projects/ms-365-mcp-server/start-mcp.sh",
+    "--toon"
+  ]
+}
+```
+
+Tool names within the sidecar's MCP session are UNPREFIXED (just `list_emails_in_folder`, `get_email_by_uid`, `delete_messages`, etc.) because the sidecar talks to the server directly — the `mcp_rustymail_` prefix only exists on the openfang-routed names you see in your own tool list.
+
+For the sidecar's `list_tool`, prefer `list_cached_emails` when available (it's paged and reads from the local cache). Pass `page_size` (default 500) explicitly when calling `rank-senders` or `contacts-bootstrap` against a large folder — they paginate automatically until they see a short page.
+
 ## Memory keys
 
 Full schema at `docs/memory-schema.md` in the hand repo. The live keys this cycle reads or writes:
@@ -330,7 +358,10 @@ For each account in `accounts`:
 1. Build the fetch-batch request:
    ```json
    {
-     "mcp_server": {"command": ["mcp_rustymail_stdio_command_here"]},
+     "mcp_server": {"command": [
+       "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio-high-level",
+       "--backend-url", "http://localhost:9437/mcp"
+     ]},
      "selector": {"kind": "uids", "uids": [<UIDs since cursor>], "folder": "INBOX"},
      "max_messages": <max_messages_per_tick>,
      "max_body_chars": 8000

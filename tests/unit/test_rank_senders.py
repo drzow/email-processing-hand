@@ -205,6 +205,35 @@ def test_rejects_unknown_metric() -> None:
     assert "metric" in env["error"]["message"]
 
 
+def test_pagination_aggregates_across_multiple_pages() -> None:
+    """The BigBox fixture has 12 messages from 4 senders. With page_size=5
+    the sidecar must call the list tool 3 times (5 + 5 + 2) and aggregate
+    all 12 to produce correct per-sender counts."""
+    env = run_rank(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "list_tool": "list_emails_in_folder",
+            "folders": ["BigBox"],
+            "metric": "count",
+            "limit": 10,
+            "page_size": 5,
+        }
+    )
+    assert env["status"] == "ok"
+    summary = env["result"]["scan_summary"]
+    assert summary["messages_scanned"] == 12
+    # 4 senders, each seen 3 times (BigBox round-robins 4 senders × 3).
+    by_sender = {r["sender"]: r["message_count"] for r in env["result"]["ranking"]}
+    assert by_sender == {
+        "bigsender@example.com": 3,
+        "frequent@example.com": 3,
+        "occasional@example.com": 3,
+        "rare@example.com": 3,
+    }
+    # We made multiple pages of MCP calls (3 for BigBox).
+    assert env["metrics"]["mcp_calls"] >= 3
+
+
 def test_propagates_mcp_error_from_list_tool() -> None:
     env = run_rank(
         {

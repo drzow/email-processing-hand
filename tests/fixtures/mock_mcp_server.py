@@ -90,6 +90,24 @@ MOCK_THREADS: dict[int, dict] = {
 
 # Folder listings for rank-senders tests. Each "message" carries enough
 # metadata to aggregate by sender without a separate fetch.
+# Big synthetic folder for pagination tests. 12 messages from 4 senders
+# so a page_size of 5 forces exactly 3 paginated calls (5 + 5 + 2).
+_BIG_BOX: list[dict] = []
+for _i in range(12):
+    _sender_idx = _i % 4
+    _sender = ["bigsender@example.com", "frequent@example.com",
+               "occasional@example.com", "rare@example.com"][_sender_idx]
+    _BIG_BOX.append(
+        {
+            "uid": 700 + _i,
+            "from": _sender,
+            "subject": f"Item {_i}",
+            "date": f"2026-03-{_i+1:02d}T10:00:00Z",
+            "size_bytes": 1000 + _i,
+        }
+    )
+
+
 FOLDER_MESSAGES: dict[str, list[dict]] = {
     "INBOX": [
         {
@@ -164,6 +182,7 @@ FOLDER_MESSAGES: dict[str, list[dict]] = {
             "size_bytes": 4000,
         },
     ],
+    "BigBox": _BIG_BOX,
     "Sent Items": [
         {
             "uid": 600,
@@ -306,7 +325,15 @@ def _handle(req: dict) -> None:
             return
         if name == "list_emails_in_folder":
             folder = args.get("folder", "INBOX")
-            messages = FOLDER_MESSAGES.get(folder, [])
+            all_msgs = FOLDER_MESSAGES.get(folder, [])
+            # Honor limit + offset so pagination tests can verify the
+            # subcommands actually call us repeatedly with rising offsets.
+            offset = int(args.get("offset", 0) or 0)
+            limit = args.get("limit")
+            if limit is None:
+                page = all_msgs[offset:]
+            else:
+                page = all_msgs[offset : offset + int(limit)]
             _result(
                 req_id,
                 {
@@ -314,7 +341,7 @@ def _handle(req: dict) -> None:
                         {
                             "type": "text",
                             "text": json.dumps(
-                                {"messages": messages, "total": len(messages)}
+                                {"messages": page, "total": len(all_msgs)}
                             ),
                         }
                     ]

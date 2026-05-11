@@ -189,6 +189,29 @@ def test_requires_accounts_list() -> None:
     assert "accounts" in env["error"]["message"]
 
 
+def test_pagination_walks_all_pages_of_sent_folder() -> None:
+    """BigBox is the fixture's paginated-test folder. With page_size=5
+    the sidecar must call list_emails_in_folder 3 times before it sees
+    a short page (12 total messages, pages of 5/5/2)."""
+    env = run_contacts(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "list_tool": "list_emails_in_folder",
+            "accounts": [
+                {"account_id": "alice@scalesology.com", "sent_folder": "BigBox"}
+            ],
+            "page_size": 5,
+        }
+    )
+    summary = env["result"]["scan_summary"]
+    # BigBox has 12 messages; from is the only address, no to/cc, so we
+    # need to count From: addresses captured. Wait — contacts-bootstrap
+    # captures To/Cc, not From. BigBox has no To/Cc fields in fixture,
+    # so addresses_found should be 0 but messages_scanned still 12.
+    assert summary["sent_messages_scanned"] == 12
+    assert env["metrics"]["mcp_calls"] >= 3
+
+
 def test_per_account_mcp_error_does_not_kill_run() -> None:
     """If one account fails, the other still completes; the failing
     account is named in scan_summary.per_account[*].error."""

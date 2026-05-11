@@ -265,6 +265,59 @@ def _fetch_batch(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     )
 
 
+def _paginate_messages(
+    client: Any,
+    tool_name: str,
+    base_args: dict[str, Any],
+    *,
+    page_size: int = 500,
+    max_pages: int = 200,
+) -> list[dict[str, Any]]:
+    """Call ``tool_name`` repeatedly with rising ``offset`` until the page
+    comes back smaller than ``page_size`` (or we've seen ``total``).
+
+    Returns a single flat list of messages. Lets callers stay agnostic
+    about how many pages were needed.
+
+    ``max_pages`` is a defense in case a buggy server returns full pages
+    forever — we cap at 200 * page_size = 100k messages by default, which
+    is well above any realistic single-folder count.
+    """
+    from lib.mcp_client import McpClientError
+
+    out: list[dict[str, Any]] = []
+    offset = 0
+    pages = 0
+    seen_total: int | None = None
+    while pages < max_pages:
+        args = dict(base_args)
+        args["limit"] = page_size
+        args["offset"] = offset
+        try:
+            tool_result = client.call_tool(tool_name, args)
+        except McpClientError:
+            raise
+        payload = _extract_payload(tool_result)
+        if isinstance(payload, dict):
+            messages = payload.get("messages") or []
+            if seen_total is None:
+                seen_total = payload.get("total")
+        elif isinstance(payload, list):
+            messages = payload
+        else:
+            messages = []
+        out.extend(messages)
+        # Termination: under-full page, OR we know `total` and we've
+        # reached it, OR we got zero messages.
+        if len(messages) < page_size:
+            break
+        if seen_total is not None and len(out) >= seen_total:
+            break
+        offset += page_size
+        pages += 1
+    return out
+
+
 def _extract_payload(tool_result: dict[str, Any]) -> dict[str, Any]:
     """Pull the payload dict out of an MCP tools/call result envelope.
 
@@ -433,6 +486,7 @@ def _contacts_bootstrap(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     per_account: list[dict[str, Any]] = []
     total_scanned = 0
     mcp_calls = 0
+    page_size = int(request.get("page_size", 500))
 
     client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
     try:
@@ -447,20 +501,19 @@ def _contacts_bootstrap(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
                 "addresses_found": 0,
                 "error": None,
             }
-            mcp_calls += 1
             try:
-                tool_result = client.call_tool(
-                    list_tool, {"folder": sent_folder, "account_id": account_id}
+                messages = _paginate_messages(
+                    client,
+                    list_tool,
+                    {"folder": sent_folder, "account_id": account_id},
+                    page_size=page_size,
                 )
             except McpClientError as e:
                 acct_summary["error"] = str(e)
                 per_account.append(acct_summary)
                 continue
+            mcp_calls += max(1, (len(messages) + page_size - 1) // page_size)
 
-            payload = _extract_payload(tool_result)
-            messages = (
-                payload.get("messages") if isinstance(payload, dict) else None
-            ) or (payload if isinstance(payload, list) else [])
             seen_in_account: set[str] = set()
             for msg in messages:
                 date = msg.get("date") or ""
@@ -713,18 +766,18 @@ def _rank_senders(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
             if not folders:
                 folders = []
 
+        page_size = int(request.get("page_size", 500))
         for folder in folders:
-            mcp_calls += 1
             args = dict(list_tool_args)
             args["folder"] = folder
             try:
-                tool_result = client.call_tool(list_tool, args)
+                entries = _paginate_messages(
+                    client, list_tool, args, page_size=page_size
+                )
             except McpClientError as e:
                 raise SidecarError("mcp_error", str(e)) from e
-            payload = _extract_payload(tool_result)
-            entries = (
-                payload.get("messages") if isinstance(payload, dict) else None
-            ) or (payload if isinstance(payload, list) else [])
+            # mcp_calls grows by ceil(len(entries)/page_size); approximate.
+            mcp_calls += max(1, (len(entries) + page_size - 1) // page_size)
             for entry in entries:
                 messages_scanned += 1
                 if cutoff and (entry.get("date") or "") <= cutoff:
