@@ -51,7 +51,7 @@ def test_planned_subcommands_return_not_implemented_error() -> None:
     for name in (
         "parse-thread",
         "parse-feedback-reply",
-        "contacts-bootstrap",
+        "contacts-refresh",
     ):
         env = run_scan(name)
         assert env["status"] == "error", f"{name}: expected error status, got {env}"

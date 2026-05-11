@@ -310,6 +310,127 @@ def _shape_message(
 
 
 # ---------------------------------------------------------------------------
+# submit-unsubscribe — RFC 8058 List-Unsubscribe-Post + GET fallback.
+# For mailto: targets, we return the to/subject/body for the agent to
+# send via the email MCP server (we don't ship SMTP plumbing here).
+# ---------------------------------------------------------------------------
+
+
+@register("submit-unsubscribe")
+def _submit_unsubscribe(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    import urllib.error
+    import urllib.request
+
+    url = request.get("list_unsubscribe_url")
+    mailto = request.get("list_unsubscribe_mailto")
+    if not url and not mailto:
+        raise SidecarError(
+            "bad_request",
+            "either list_unsubscribe_url or list_unsubscribe_mailto is required",
+        )
+
+    if mailto:
+        return (
+            {
+                "status": "mailto_returned_for_agent",
+                "mailto": {
+                    "to": mailto,
+                    "subject": request.get("list_unsubscribe_mailto_subject", "unsubscribe"),
+                    "body": request.get("list_unsubscribe_mailto_body", ""),
+                },
+                "attempted_methods": [],
+                "response_code": None,
+            },
+            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+        )
+
+    assert url is not None
+    if not url.lower().startswith(("http://", "https://")):
+        raise SidecarError(
+            "bad_request",
+            f"unsupported url scheme; expected http(s), got {url!r}",
+        )
+
+    post_value = request.get("list_unsubscribe_post")
+    fall_back_to_get = bool(request.get("fall_back_to_get", False))
+    timeout_secs = float(request.get("timeout_secs", 15.0))
+
+    attempted: list[str] = []
+    last_code: int | None = None
+
+    if post_value:
+        attempted.append("post")
+        code = _http_post(url, post_value, timeout_secs)
+        last_code = code
+        if 200 <= code < 300:
+            return (
+                _result_envelope("submitted", attempted, code, url),
+                {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+            )
+        if not fall_back_to_get:
+            return (
+                _result_envelope("failed", attempted, code, url),
+                {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+            )
+
+    # Plain GET path — either there was no Post header or the POST failed
+    # and we were asked to fall back.
+    attempted.append("get")
+    code = _http_get(url, timeout_secs)
+    last_code = code
+    status = "submitted" if 200 <= code < 300 else "failed"
+    return (
+        _result_envelope(status, attempted, last_code, url),
+        {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+    )
+
+
+def _http_post(url: str, body: str, timeout_secs: float) -> int:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=body.encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as e:
+        return int(e.code)
+    except urllib.error.URLError as e:
+        # Network failure looks like a 599 to keep the result shape stable.
+        return 599
+
+
+def _http_get(url: str, timeout_secs: float) -> int:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as e:
+        return int(e.code)
+    except urllib.error.URLError:
+        return 599
+
+
+def _result_envelope(
+    status: str, attempted: list[str], code: int | None, url: str
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "url": url,
+        "attempted_methods": attempted,
+        "response_code": code,
+    }
+
+
+# ---------------------------------------------------------------------------
 # rank-senders — aggregate by sender across one or more folders, sort by
 # count or volume. Powers backlog mode's "top senders by count/volume"
 # workflows. No fetch of message bodies — only header-derivable fields.
@@ -623,7 +744,6 @@ _PLANNED = [
     "contacts-refresh",
     "parse-thread",
     "parse-feedback-reply",
-    "submit-unsubscribe",
 ]
 
 for _name in _PLANNED:
