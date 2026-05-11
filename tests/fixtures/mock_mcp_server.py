@@ -45,6 +45,49 @@ CANNED_MESSAGES: dict[int, str] = {
 }
 
 
+def _thread_msg(uid: int, root: int, date: str, body: str = "body") -> dict:
+    """Builder for the parse-thread fixture data."""
+    return {
+        "uid": uid,
+        "folder": "INBOX",
+        "headers": {
+            "from": [{"name": "Sam", "addr": "sam@acme.com"}],
+            "to": [{"name": "", "addr": "alice@scalesology.com"}],
+            "cc": [],
+            "subject": f"Re: Q3 plan (msg {uid})",
+            "date": date,
+            "message_id": f"<msg-{uid}@acme.com>",
+            "in_reply_to": f"<msg-{root}@acme.com>" if uid != root else None,
+            "references": [],
+            "list_id": None,
+            "list_unsubscribe": {"urls": [], "mailtos": []},
+            "list_unsubscribe_post_one_click": False,
+            "importance": None,
+        },
+        "body_text": body,
+        "body_truncated": False,
+    }
+
+
+MOCK_THREADS: dict[int, dict] = {
+    1001: {
+        "thread_id": "thread-1001",
+        "messages": [
+            _thread_msg(1001, 1001, "2026-05-01T10:00:00Z"),
+            _thread_msg(1002, 1001, "2026-05-02T10:00:00Z"),
+            _thread_msg(1003, 1001, "2026-05-03T10:00:00Z"),
+        ],
+    },
+    1002: {
+        "thread_id": "thread-1002",
+        "messages": [
+            _thread_msg(2000 + i, 1002, f"2026-04-{i+1:02d}T10:00:00Z")
+            for i in range(10)
+        ],
+    },
+}
+
+
 # Folder listings for rank-senders tests. Each "message" carries enough
 # metadata to aggregate by sender without a separate fetch.
 FOLDER_MESSAGES: dict[str, list[dict]] = {
@@ -90,6 +133,55 @@ FOLDER_MESSAGES: dict[str, list[dict]] = {
             "subject": "Note to self",
             "date": "2026-05-04T11:00:00Z",
             "size_bytes": 800,
+        },
+    ],
+    "Sent": [
+        {
+            "uid": 500,
+            "from": "Alice Brugger <alice@scalesology.com>",
+            "to": "Sam Long <sam@acme.com>",
+            "cc": "",
+            "subject": "Re: Q3 plan questions",
+            "date": "2026-04-01T10:00:00Z",
+            "size_bytes": 5000,
+        },
+        {
+            "uid": 501,
+            "from": "alice@scalesology.com",
+            "to": "Sam Long <sam@acme.com>, Alex Lee <alex@partner.com>",
+            "cc": "Bob <bob@partner.com>",
+            "subject": "Joint planning sync",
+            "date": "2026-04-15T11:00:00Z",
+            "size_bytes": 6000,
+        },
+        {
+            "uid": 502,
+            "from": "alice@scalesology.com",
+            "to": "alex@partner.com",
+            "cc": "",
+            "subject": "FYI",
+            "date": "2026-04-20T09:00:00Z",
+            "size_bytes": 4000,
+        },
+    ],
+    "Sent Items": [
+        {
+            "uid": 600,
+            "from": "alice@bruggerink.com",
+            "to": "Sam Long <sam@acme.com>",
+            "cc": "",
+            "subject": "Personal follow-up",
+            "date": "2026-04-05T19:00:00Z",
+            "size_bytes": 3000,
+        },
+        {
+            "uid": 601,
+            "from": "alice@bruggerink.com",
+            "to": "Friend <pal@example.com>",
+            "cc": "",
+            "subject": "Hey",
+            "date": "2026-04-10T18:00:00Z",
+            "size_bytes": 2500,
         },
     ],
     "Archive": [
@@ -227,6 +319,17 @@ def _handle(req: dict) -> None:
                         }
                     ]
                 },
+            )
+            return
+        if name == "get_thread":
+            root_uid = int(args.get("thread_root_uid", 0))
+            thread = MOCK_THREADS.get(root_uid)
+            if thread is None:
+                _error(req_id, -32602, f"unknown thread root uid {root_uid}")
+                return
+            _result(
+                req_id,
+                {"content": [{"type": "text", "text": json.dumps(thread)}]},
             )
             return
         if name == "search_by_sender":

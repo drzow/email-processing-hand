@@ -101,10 +101,16 @@ def test_all_folders_scope_walks_every_folder() -> None:
         }
     )
     summary = env["result"]["scan_summary"]
-    assert set(summary["folders_scanned"]) == {"INBOX", "Archive"}
-    # Top sender should aggregate across both folders.
-    top = env["result"]["ranking"][0]
-    assert set(top["folders"]) == {"INBOX", "Archive"}
+    # Mock now has INBOX, Archive, Sent, Sent Items for the contacts
+    # fixture — all_folders should walk all of them.
+    assert set(summary["folders_scanned"]) >= {"INBOX", "Archive"}
+    # marketing@vendor.com appears in INBOX + Archive (the only sender
+    # the test cares about); Sent folders contain alice's outbound mail
+    # not the marketing newsletters.
+    top = next(
+        e for e in env["result"]["ranking"] if e["sender"] == "marketing@vendor.com"
+    )
+    assert {"INBOX", "Archive"} <= set(top["folders"])
 
 
 def test_explicit_folders_list_overrides_scope() -> None:

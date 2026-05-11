@@ -310,6 +310,233 @@ def _shape_message(
 
 
 # ---------------------------------------------------------------------------
+# parse-thread — fetch a thread and decide which messages to display
+# in full vs. elide to a summary line. Threads over `max_displayed`
+# entries keep the newest N as full messages; the older remainder is
+# returned as (subject, from, date) tuples sorted oldest-first.
+# ---------------------------------------------------------------------------
+
+
+@register("parse-thread")
+def _parse_thread(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.mcp_client import McpClient, McpClientError
+
+    server_cfg = request.get("mcp_server")
+    if not server_cfg or "command" not in server_cfg:
+        raise SidecarError("bad_request", "mcp_server.command is required")
+    thread_root_uid = request.get("thread_root_uid")
+    if thread_root_uid is None:
+        raise SidecarError("bad_request", "thread_root_uid is required")
+    fetch_tool = request.get("fetch_tool", "get_thread")
+    account_id = request.get("account_id")
+    max_displayed = int(request.get("max_displayed", 5))
+
+    client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
+    try:
+        client.open()
+        try:
+            tool_result = client.call_tool(
+                fetch_tool,
+                {"account_id": account_id, "thread_root_uid": int(thread_root_uid)},
+            )
+        except McpClientError as e:
+            raise SidecarError("mcp_error", str(e)) from e
+    finally:
+        client.close()
+
+    payload = _extract_payload(tool_result)
+    if not isinstance(payload, dict):
+        raise SidecarError(
+            "protocol_error",
+            f"get_thread tool returned a non-object payload: {type(payload).__name__}",
+        )
+    messages = payload.get("messages") or []
+    thread_id = payload.get("thread_id")
+
+    # Newest-first ordering. Empty / missing dates sort to the end.
+    sorted_msgs = sorted(
+        messages,
+        key=lambda m: (m.get("headers") or {}).get("date") or "",
+        reverse=True,
+    )
+    displayed = sorted_msgs[:max_displayed]
+    elided_raw = sorted_msgs[max_displayed:]
+
+    # Elided entries sort oldest-first so the agent can render them as
+    # a chronological summary above the displayed top.
+    elided = [
+        {
+            "subject": (m.get("headers") or {}).get("subject", ""),
+            "from": _first_from((m.get("headers") or {}).get("from") or []),
+            "date": (m.get("headers") or {}).get("date", ""),
+        }
+        for m in sorted(
+            elided_raw, key=lambda m: (m.get("headers") or {}).get("date") or ""
+        )
+    ]
+
+    return (
+        {
+            "thread_id": thread_id,
+            "displayed": displayed,
+            "elided": elided,
+            "elided_count": len(elided),
+            "total_count": len(messages),
+        },
+        {
+            "messages_scanned": len(messages),
+            "mcp_calls": 1,
+            "result_bytes": 0,
+        },
+    )
+
+
+def _first_from(from_field: Any) -> dict[str, str]:
+    """Coerce a from-field to a plain {name, addr} pair (or empty)."""
+    if isinstance(from_field, list) and from_field:
+        head = from_field[0]
+        if isinstance(head, dict):
+            return {"name": head.get("name", ""), "addr": head.get("addr", "")}
+    if isinstance(from_field, str):
+        return {"name": "", "addr": from_field}
+    return {"name": "", "addr": ""}
+
+
+# ---------------------------------------------------------------------------
+# contacts-bootstrap — walk Sent folders across configured accounts and
+# build the global contact list (`email.contacts`). For each address we
+# observe in To/Cc, record display name (first observation wins),
+# first_seen, last_seen, message_count, and the set of accounts whose
+# Sent folder it appeared in. Used during first-run + for the "known
+# sender" signal in classify-context.
+# ---------------------------------------------------------------------------
+
+
+@register("contacts-bootstrap")
+def _contacts_bootstrap(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    from lib.headers import parse_address_list
+    from lib.mcp_client import McpClient, McpClientError
+
+    server_cfg = request.get("mcp_server")
+    if not server_cfg or "command" not in server_cfg:
+        raise SidecarError("bad_request", "mcp_server.command is required")
+    accounts = request.get("accounts")
+    if not accounts:
+        raise SidecarError(
+            "bad_request",
+            "accounts list is required: [{account_id, sent_folder}, ...]",
+        )
+    list_tool = request.get("list_tool", "list_emails_in_folder")
+    since_cutoff = request.get("since")  # ISO-8601 string or None
+
+    contacts: dict[str, dict[str, Any]] = {}
+    per_account: list[dict[str, Any]] = []
+    total_scanned = 0
+    mcp_calls = 0
+
+    client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
+    try:
+        client.open()
+        for acct in accounts:
+            account_id = acct.get("account_id") or "?"
+            sent_folder = acct.get("sent_folder") or "Sent"
+            acct_summary = {
+                "account_id": account_id,
+                "sent_folder": sent_folder,
+                "messages_scanned": 0,
+                "addresses_found": 0,
+                "error": None,
+            }
+            mcp_calls += 1
+            try:
+                tool_result = client.call_tool(
+                    list_tool, {"folder": sent_folder, "account_id": account_id}
+                )
+            except McpClientError as e:
+                acct_summary["error"] = str(e)
+                per_account.append(acct_summary)
+                continue
+
+            payload = _extract_payload(tool_result)
+            messages = (
+                payload.get("messages") if isinstance(payload, dict) else None
+            ) or (payload if isinstance(payload, list) else [])
+            seen_in_account: set[str] = set()
+            for msg in messages:
+                date = msg.get("date") or ""
+                if since_cutoff and date and date < since_cutoff:
+                    continue
+                acct_summary["messages_scanned"] += 1
+                total_scanned += 1
+                for field in ("to", "cc"):
+                    for entry in parse_address_list(msg.get(field) or ""):
+                        addr = entry["addr"]
+                        if not addr:
+                            continue
+                        seen_in_account.add(addr)
+                        _upsert_contact(
+                            contacts,
+                            addr=addr,
+                            name=entry["name"],
+                            date=date,
+                            account_id=account_id,
+                        )
+            acct_summary["addresses_found"] = len(seen_in_account)
+            per_account.append(acct_summary)
+    finally:
+        client.close()
+
+    return (
+        {
+            "version": 1,
+            "contacts": contacts,
+            "scan_summary": {
+                "sent_messages_scanned": total_scanned,
+                "addresses_found": len(contacts),
+                "per_account": per_account,
+            },
+        },
+        {
+            "messages_scanned": total_scanned,
+            "mcp_calls": mcp_calls,
+            "result_bytes": 0,
+            "unique_addresses": len(contacts),
+        },
+    )
+
+
+def _upsert_contact(
+    contacts: dict[str, dict[str, Any]],
+    *,
+    addr: str,
+    name: str,
+    date: str,
+    account_id: str,
+) -> None:
+    entry = contacts.get(addr)
+    if entry is None:
+        entry = {
+            "display_name": name,
+            "first_seen": date or None,
+            "last_seen": date or None,
+            "message_count": 0,
+            "accounts": [],
+        }
+        contacts[addr] = entry
+    entry["message_count"] += 1
+    # First-observation wins for display_name unless we never had one.
+    if not entry["display_name"] and name:
+        entry["display_name"] = name
+    if date:
+        if not entry["first_seen"] or date < entry["first_seen"]:
+            entry["first_seen"] = date
+        if not entry["last_seen"] or date > entry["last_seen"]:
+            entry["last_seen"] = date
+    if account_id not in entry["accounts"]:
+        entry["accounts"].append(account_id)
+
+
+# ---------------------------------------------------------------------------
 # submit-unsubscribe — RFC 8058 List-Unsubscribe-Post + GET fallback.
 # For mailto: targets, we return the to/subject/body for the agent to
 # send via the email MCP server (we don't ship SMTP plumbing here).
@@ -740,9 +967,7 @@ def _split_body(raw: str) -> str:
 # subcommand" message lists them, even though they raise NotImplemented
 # until their slice ships. Mirrors design.md §6.
 _PLANNED = [
-    "contacts-bootstrap",
     "contacts-refresh",
-    "parse-thread",
     "parse-feedback-reply",
 ]
 

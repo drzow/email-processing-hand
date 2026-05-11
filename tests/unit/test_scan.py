@@ -49,7 +49,6 @@ def test_planned_subcommands_return_not_implemented_error() -> None:
     # Each subcommand declared in scan._PLANNED should exit cleanly with a
     # structured "not_implemented" error envelope rather than crashing.
     for name in (
-        "parse-thread",
         "parse-feedback-reply",
         "contacts-refresh",
     ):
