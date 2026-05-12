@@ -252,8 +252,12 @@ format     = "number"
 name                    = "email-processing-hand"
 description             = "Classifies and processes incoming email across two accounts; manages Sieve filters and project digests."
 module                  = "builtin:chat"
-provider                = "default"
-model                   = "default"
+# Sonnet pinned explicitly. The multi-phase state machine + JSON tool
+# argument shaping + shell_exec invocations defeat smaller models —
+# Qwen 3.6 35B and Haiku both produced fabricated rules + auto-acceptance
+# during early testing. Bump to opus for harder runs if needed.
+provider                = "claude-code"
+model                   = "claude-code/sonnet"
 max_tokens              = 32768
 temperature             = 0.1
 max_iterations          = 80
@@ -616,12 +620,13 @@ Each user message during an active backlog session triggers ONE iteration of thi
      "position": 0,
      "queue": [<initial item list>],
      "pending_proposal": null,
+     "pending_rules": [],
      "totals": {
        "proposals_made": 0,
        "accepted_first_try": 0,
        "corrected": 0,
        "skipped": 0,
-       "rules_learned": 0,
+       "rules_proposed": 0,
        "messages_moved": 0,
        "messages_deleted": 0,
        "unsubscribes_submitted": 0
@@ -633,6 +638,16 @@ Each user message during an active backlog session triggers ONE iteration of thi
    To build the `queue`:
    - For `top_count_*` / `top_volume_*`: shell_exec `python3 /home/zow/projects/email-processing-hand/tools/scan.py rank-senders` with `metric`, `scope`, `limit`. Each ranking entry becomes a queue item shaped `{"kind": "sender_cluster", "sender": addr, "name": name, "message_count": n, "total_bytes": b, "sample_subjects": [...], "folders": [...]}`.
    - For `recent_inbox` / `oldest_inbox`: shell_exec `fetch-batch` with `selector.kind="uids"` plus a list_emails_by_flag call to discover the N most recent / oldest UIDs. Each message becomes a queue item shaped `{"kind": "message", "uid": ..., "folder": ..., "headers": {...}, "body_text": "..."}`.
+
+### ⚠ HALLUCINATION GUARD — read this every iteration
+
+The agent that previously ran this hand (Haiku) fabricated entire emails when its MCP fetches failed. To prevent recurrence, the following rules are NON-NEGOTIABLE:
+
+1. **Every queue item MUST be traceable to a real MCP response.** Each `kind=message` item carries literal `uid`, `folder`, `message_id`, `from_address`, `subject`, and `cached_at` fields populated directly from a tool result. Each `kind=sender_cluster` item carries literal `sender`, `message_count`, `folders`, and at least one verified `sample_uid` referencing a real message in the cluster.
+2. **You are FORBIDDEN from generating message content.** Subject lines, body text, sender names, dates — all of these come from MCP responses or the sidecar. NEVER write a plausible-looking email "to demonstrate the flow." If you don't have data, you don't have a proposal.
+3. **Tool failures stop the session.** If `fetch-batch` returns fewer items than requested, OR `list_emails_by_flag` returns an empty list when you expected results, OR any MCP/sidecar call returns an error or unparseable payload: set `training_state.status = "error"`, write the literal error to the user, exit. Do NOT improvise. Do NOT retry with a "natural language" workaround tool. Do NOT continue to the next queue item.
+4. **The proposal card MUST echo the verifiable fields** — uid, folder, message_id, cached_at (or sample_uid + cluster size for clusters) — so the user can spot fabrication immediately.
+5. **If you find yourself reasoning "the user probably has emails from X, let me propose Y for it" without a concrete UID in hand**, STOP. You are hallucinating. Reset to Step A and re-fetch.
 
 3. If present and `status = "running"`: this is a resumption or a response to the prior proposal. Go to Step B.
 
@@ -650,7 +665,7 @@ Then EXECUTE the action per Step E. Then go to Step C.
 
 ### Step C — pick the next item
 
-`item = queue[position]`. If `position >= len(queue)`, this workflow is done. Update `training_state.status = "complete"`, summarize totals, exit.
+`item = queue[position]`. If `position >= len(queue)`, this workflow is done. Set `training_state.status = "awaiting_commit"` and go to **Step F (commit confirmation)** — do NOT auto-persist or auto-regen Sieve.
 
 ### Step D — propose a classification
 
@@ -702,6 +717,19 @@ Proposed: **<bucket>** (confidence <c>) — <reasoning>
   pause        save progress and stop
 ```
 
+### ⚠ ONE-PROPOSAL-PER-ITERATION INVARIANT — non-negotiable
+
+After persisting `pending_proposal` to `training_state` AND writing the proposal card as your user-facing reply, you MUST terminate this iteration:
+
+- **Do NOT call any further tools** (memory_store the state and the proposal — that's it).
+- **Do NOT advance `position`.**
+- **Do NOT generate additional proposal cards in the same reply.**
+- **Do NOT pre-fetch the next item "to save time."**
+
+The user's next message will trigger a new iteration. That iteration starts at Step B (process the response), then Step C, then Step D for the *next* item. One proposal per turn. Always.
+
+If you catch yourself about to render a second proposal card in a single iteration, STOP. That's the auto-acceptance bug from previous sessions. Emit an `email_processing_error` event with `{component: "phase9", error: "attempted multi-item iteration"}` and exit.
+
 Exit. Wait for the user's next message.
 
 ### Step E — execute the action
@@ -712,6 +740,34 @@ When the user accepts or overrides, execute the chosen bucket's handler with:
 - Bucket 1 / 2 scope = INBOX + Archive always.
 - Bucket 3 / 8 / 9 / 10 / 13 scope = workflow's `scope_folders`.
 - Bucket 4-7 scope = the message's folder (calendar invites are inherently per-message).
+
+### ⚠ RULES STAGE TO `pending_rules`, NOT `sender_rules`
+
+The MOVE / DELETE / UNSUBSCRIBE actions on existing messages happen NOW (the user just consented to them). The proposed RULE for future mail does NOT yet go into the durable `email.account.<id>.sender_rules` blob. Instead:
+
+- Append the proposed rule to `training_state.pending_rules` (per-session staging).
+- The rule's effect on future mail will not take effect until Step F (commit) is approved.
+- Sieve regen does NOT fire after each item — it batches at Step G.
+
+`pending_rules` entries look like:
+
+```json
+{
+  "rule_id": "r_<iso>_<counter>",
+  "scope": "sender" | "domain" | "thread",
+  "value": "<addr | domain | thread-id>",
+  "kind": "deterministic" | "content_dependent",
+  "bucket": "<one of 13>",
+  "options": {...},
+  "learned_at": "<iso>",
+  "source_message_id": "<the real message_id that drove this proposal>",
+  "source_uid": <real uid>,
+  "user_response": "accepted" | "corrected",
+  "original_proposal": {<the full proposal blob>}
+}
+```
+
+`source_uid` and `source_message_id` MUST come from real MCP-returned data — same hallucination guard as Step A.
 
 For each bucket, the concrete tool calls are below. After execution: update `training_state.totals`, increment `position`, clear `pending_proposal`, persist, then go to Step C.
 
@@ -781,17 +837,67 @@ Slack alert + digest entry. Persist rule. Ticketing deferred to v2.
 
 No action. Append digest entry "Couldn't classify". No rule. Increment `skipped`.
 
-### Step F — Sieve regen (deferred to end of workflow)
+### Step F — Commit confirmation (NEW — gate before durable persistence)
 
-When `position >= len(queue)` (Step C completion) AND any deterministic rule was added/changed during this session AND the account is IMAP AND `sieve_enabled`:
+When Step C signals the queue is exhausted, do NOT persist anything to long-term memory yet. Instead, render this card to the user and exit:
 
-1. memory_recall `email.account.<id>.sender_rules`.
-2. shell_exec `python3 -c "import sys, json; from lib.sieve import build_with_summary; body, summary = build_with_summary(json.load(sys.stdin)['rules']); print(json.dumps({'body': body, 'summary': summary}))"` with the rules on stdin. (Or call `build_script_body` directly if you've imported it inline.)
-3. MCP `sieve_check_script(body=<body>)`. If validation fails, do NOT push; log and surface error to user.
-4. MCP `sieve_put_script(name="openfang-managed.sieve", body=<body>)`.
-5. MCP `sieve_set_active(name="openfang-managed.sieve")`.
-6. memory_store `email.account.<id>.sieve_state` with `{version: 1, active_script_name, rule_id_list, last_sync_to_server, summary}`.
-7. Report to user: "Sieve script regenerated and activated: N rules pushed, M skipped (<reasons>)."
+```
+Backlog session complete (<workflow>): <N> items processed in <elapsed>.
+  Accepted on first proposal:  <X>/<N>  (<percent>%)
+  Corrected:                   <Y>
+  Skipped:                     <Z>
+
+Real-world actions already executed (irreversible):
+  Messages moved:              <M> (during the session, after each <Enter>)
+  Messages deleted:            <D>
+  Unsubscribes submitted:      <U>
+
+Rules learned this session (NOT YET COMMITTED to long-term memory):
+
+  | rule_id              | bucket          | scope  | value                          | source_uid |
+  |----------------------|-----------------|--------|--------------------------------|------------|
+  | r_<iso>_001          | Filter          | sender | noreply@github.com             | 17930      |
+  | r_<iso>_002          | UnsubAndBlock   | sender | infogrp@stansdonuts.com        | 17966      |
+  | ...                                                                                            |
+
+⚠ Review the source_uid column — every rule should trace to a real
+  message UID you saw during the session. If any rule references a
+  message you did NOT see proposed, type `audit` for details before
+  committing.
+
+To finalize:
+  commit session rules         → persist to sender_rules + regen Sieve if enabled
+  commit session rules no-sieve → persist to sender_rules only (skip Sieve)
+  discard session rules        → throw out all <K> pending rules
+  audit                        → show the original proposal + your response
+                                 for each rule, for review before committing
+```
+
+Set `training_state.status = "awaiting_commit"` and exit.
+
+On the user's next message:
+
+- `commit session rules` → go to Step G (real persistence).
+- `commit session rules no-sieve` → go to Step G, but skip the Sieve regen sub-steps.
+- `discard session rules` → clear `pending_rules`, set `training_state.status = "discarded"`, render "Discarded <K> rules. Real-world moves/deletes already executed cannot be undone — refer to Archive/Trash to retrieve mistakes." Exit.
+- `audit` → for each rule in `pending_rules`, render `original_proposal` + `user_response` so the user can spot fabricated source_uids. Then re-render the commit card.
+
+Any other input → re-prompt with the commit card unchanged.
+
+### Step G — Persist + Sieve regen (only after commit)
+
+Only reached when the user has typed `commit session rules` or `commit session rules no-sieve` after Step F:
+
+1. memory_recall `email.account.<id>.sender_rules` (current persisted rules).
+2. For each entry in `training_state.pending_rules`: upsert into the sender_rules list keyed by `(scope, value, kind)`. Set `confirmed_count = 1`, `corrected_count = 1 if user_response == "corrected" else 0`.
+3. memory_store `email.account.<id>.sender_rules` with the merged list.
+4. If commit was `no-sieve` OR `sieve_enabled = false` OR the account is non-IMAP: skip Sieve regen, jump to step 9.
+5. shell_exec `python3 -c "import sys, json; from lib.sieve import build_with_summary; body, summary = build_with_summary(json.load(sys.stdin)['rules']); print(json.dumps({'body': body, 'summary': summary}))"` with the merged rules on stdin.
+6. MCP `sieve_check_script(body=<body>)`. If validation fails, do NOT push; surface the error and STOP (do not call sieve_set_active). The rules are still persisted in memory; the user can fix and retry.
+7. MCP `sieve_put_script(name="openfang-managed.sieve", body=<body>)`.
+8. MCP `sieve_set_active(name="openfang-managed.sieve")`.
+9. memory_store `email.account.<id>.sieve_state` (or skip if step 4 jumped here).
+10. Clear `training_state.pending_rules`, set `status = "committed"`. Report counts to user.
 
 ### training_lock — coordinate with incremental cycles
 
