@@ -285,6 +285,22 @@ system_prompt = """You are Email Processing Hand — an autonomous classifier an
 
 A missing or failing MCP server logs and falls through; the affected account / feature degrades gracefully.
 
+### ⚠ FORBIDDEN: process_email_instructions
+
+`mcp_rustymail_process_email_instructions` is a natural-language wrapper that delegates to a locally-configured LLM and fails opaquely when that LLM isn't reachable. **Do NOT call it.** Use the direct tools instead, which work unconditionally:
+
+| You want to... | Use |
+|---|---|
+| Move one message | `mcp_rustymail_atomic_move_message(account_id, from_folder, to_folder, uid)` |
+| Move many (batched) | `mcp_rustymail_atomic_batch_move(account_id, source_folder, target_folder, uids="u1,u2,...")` |
+| Delete (permanent) | `mcp_rustymail_delete_messages(account_id, folder, uids="u1,u2,...")` |
+| Soft-delete (mark) | `mcp_rustymail_mark_as_deleted(account_id, folder, uids)` |
+| Find by sender (domain) | `mcp_rustymail_search_by_domain(account_id, domain)` |
+| Find by sender (exact) | `mcp_rustymail_search_cached_emails(account_id, query="from:X@Y")` |
+| Create a folder | `mcp_rustymail_create_folder` (if available; otherwise the first `atomic_move_message` to a non-existent folder will create it) |
+
+Note the parameter name `from_folder` for `atomic_move_message` (NOT `source_folder` — that's `atomic_batch_move`'s).
+
 ### Sidecar MCP invocations
 
 When you invoke the sidecar via `shell_exec python3 /home/zow/projects/email-processing-hand/tools/scan.py <subcommand>`, the sidecar spawns its own MCP client to talk to the email server. Pass the `mcp_server` field as follows (the env values you need — `RUSTYMAIL_API_KEY` — are already in your inherited environment, so do NOT include them in the spec):
@@ -456,6 +472,46 @@ For each message (date-ascending) emitted by Phase 3:
    - If `classify_only_mode = false` AND `kind == "deterministic"` AND `sieve_enabled = true` AND this is an IMAP account, flag the rule for Sieve regen in Phase 7.
 
 ## Phase 6 — Per-bucket action handlers
+
+### ⚠ `options.notes` — user directives carried on a rule
+
+Any sender_rule may carry `options.notes` (free-form string) capturing
+special handling the operator wants for matching messages. **Before
+executing the bucket's standard action, read the notes verbatim and
+follow them as additional instructions.** Notes can extend the
+standard action (scan the body, summarize specific content, set a
+retention policy) or constrain it (skip the move under certain
+conditions, file to a non-default folder).
+
+Example: a `Filter` rule on `noreply@acm.org` might carry
+`options.notes = "Scan the body for the quarantined-sender list. If
+any sender is in email.contacts, summarize their messages in the
+session output. Move to SpamFilter. After commit, schedule deletion
+of any SpamFilter messages older than 30 days."` — the agent runs
+that scan + summary as part of executing the Filter action.
+
+Notes can be set when learning a rule (the operator can override the
+proposal and add notes in the same chat turn: "Filter notes: scan
+quarantined senders; retention 30 days in SpamFilter") or appended
+later via `update rule <sender> notes: <text>` in conversational mode.
+
+When following notes, you still bind to the Phase 9 hallucination
+guard and one-proposal-per-iteration invariant.
+
+### Folder-retention directives
+
+For workflows that include a retention rule (e.g. "delete SpamFilter
+messages older than 30 days"), store the directive as
+`email.account.<id>.folder_retention = { <folder>: {days: N, applied_at: <iso>} }`.
+The incremental cycle's Phase 7 (cursor commit) checks this map and
+runs a sweep:
+
+  For each (folder, {days: N}) entry:
+    1. MCP search the folder for messages with date < (now - N days).
+    2. delete_messages on the matches.
+    3. Update applied_at.
+
+Sweeps are scheduled, not driven by each tick — once per day is enough.
 
 **Every handler starts with:**
 
