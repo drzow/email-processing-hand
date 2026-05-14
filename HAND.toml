@@ -301,6 +301,8 @@ A missing or failing MCP server logs and falls through; the affected account / f
 
 Note the parameter name `from_folder` for `atomic_move_message` (NOT `source_folder` — that's `atomic_batch_move`'s).
 
+**If a tool seems missing**, the answer is to check `tools/list` against the live server, NOT to assume the tool isn't available and stage a "would-have-moved" or "would-have-deleted" message. The set of exposed tools depends on which rustymail stdio variant openfang is configured with (low-level exposes mutation tools; high-level omits them). At time of this prompt, openfang is configured for **low-level**, so the table above is accurate. If you ever see "unavailable in this build" coming out of your reasoning, run a fresh `tools/list` first — the proxy may have been reconfigured.
+
 ### Sidecar MCP invocations
 
 When you invoke the sidecar via `shell_exec python3 /home/zow/projects/email-processing-hand/tools/scan.py <subcommand>`, the sidecar spawns its own MCP client to talk to the email server. Pass the `mcp_server` field as follows (the env values you need — `RUSTYMAIL_API_KEY` — are already in your inherited environment, so do NOT include them in the spec):
