@@ -18,6 +18,7 @@ subcommands report logical errors with exit 0).
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import sys
 import time
@@ -596,73 +597,157 @@ def _upsert_contact(
 # ---------------------------------------------------------------------------
 
 
+_UNSUB_KEYWORDS = ("unsubscribe", "opt-out", "opt out", "preferences", "manage subscription", "remove me")
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*\bhref\s*=\s*"([^"]+)"[^>]*>([^<]*)</a>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
 @register("submit-unsubscribe")
 def _submit_unsubscribe(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
-    import urllib.error
-    import urllib.request
-
     url = request.get("list_unsubscribe_url")
     mailto = request.get("list_unsubscribe_mailto")
-    if not url and not mailto:
-        raise SidecarError(
-            "bad_request",
-            "either list_unsubscribe_url or list_unsubscribe_mailto is required",
-        )
-
-    if mailto:
-        return (
-            {
-                "status": "mailto_returned_for_agent",
-                "mailto": {
-                    "to": mailto,
-                    "subject": request.get("list_unsubscribe_mailto_subject", "unsubscribe"),
-                    "body": request.get("list_unsubscribe_mailto_body", ""),
-                },
-                "attempted_methods": [],
-                "response_code": None,
-            },
-            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
-        )
-
-    assert url is not None
-    if not url.lower().startswith(("http://", "https://")):
-        raise SidecarError(
-            "bad_request",
-            f"unsupported url scheme; expected http(s), got {url!r}",
-        )
-
-    post_value = request.get("list_unsubscribe_post")
+    body_html = request.get("body_html")
+    body_text = request.get("body_text")
+    from_domain = request.get("from_domain")
     fall_back_to_get = bool(request.get("fall_back_to_get", False))
     timeout_secs = float(request.get("timeout_secs", 15.0))
 
-    attempted: list[str] = []
-    last_code: int | None = None
+    # ---- Priority 1: an explicit List-Unsubscribe-Post URL (RFC 8058) -----
+    if url:
+        if not url.lower().startswith(("http://", "https://")):
+            raise SidecarError(
+                "bad_request",
+                f"unsupported url scheme; expected http(s), got {url!r}",
+            )
+        post_value = request.get("list_unsubscribe_post")
+        result = _try_url(url, post_value, fall_back_to_get, timeout_secs)
+        return (
+            result,
+            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+        )
 
+    # ---- Priority 2: explicit List-Unsubscribe mailto: -------------------
+    if mailto:
+        return (
+            _mailto_envelope(
+                mailto,
+                request.get("list_unsubscribe_mailto_subject", "unsubscribe"),
+                request.get("list_unsubscribe_mailto_body", ""),
+                source="list_unsubscribe_header",
+            ),
+            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+        )
+
+    # ---- Priority 3: scrape body for unsubscribe-like links --------------
+    candidates: list[str] = _scrape_unsubscribe_urls(body_html, body_text)
+    if candidates:
+        last_result: dict[str, Any] | None = None
+        for candidate_url in candidates:
+            last_result = _try_url(
+                candidate_url, post_value=None,
+                fall_back_to_get=fall_back_to_get,
+                timeout_secs=timeout_secs,
+            )
+            last_result["scraped_from"] = "body_html"
+            last_result["scraped_candidates"] = candidates
+            if last_result["status"] == "submitted":
+                break
+        assert last_result is not None
+        return (
+            last_result,
+            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+        )
+
+    # ---- Priority 4: mailto fallback constructed from sender domain ------
+    if from_domain:
+        envelope = _mailto_envelope(
+            f"unsubscribe@{from_domain}",
+            "unsubscribe",
+            "",
+            source="from_domain_fallback",
+        )
+        return (
+            envelope,
+            {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
+        )
+
+    raise SidecarError(
+        "bad_request",
+        "no unsubscribe pathway found: provide list_unsubscribe_url, "
+        "list_unsubscribe_mailto, body_html with an unsubscribe link, "
+        "or from_domain for a mailto:unsubscribe@<domain> fallback",
+    )
+
+
+def _try_url(
+    url: str,
+    post_value: str | None,
+    fall_back_to_get: bool,
+    timeout_secs: float,
+) -> dict[str, Any]:
+    """Attempt POST (if post_value) then GET (if allowed); return result envelope."""
+    attempted: list[str] = []
     if post_value:
         attempted.append("post")
         code = _http_post(url, post_value, timeout_secs)
-        last_code = code
         if 200 <= code < 300:
-            return (
-                _result_envelope("submitted", attempted, code, url),
-                {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
-            )
+            return _result_envelope("submitted", attempted, code, url)
         if not fall_back_to_get:
-            return (
-                _result_envelope("failed", attempted, code, url),
-                {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
-            )
-
-    # Plain GET path — either there was no Post header or the POST failed
-    # and we were asked to fall back.
+            return _result_envelope("failed", attempted, code, url)
     attempted.append("get")
     code = _http_get(url, timeout_secs)
-    last_code = code
     status = "submitted" if 200 <= code < 300 else "failed"
-    return (
-        _result_envelope(status, attempted, last_code, url),
-        {"messages_scanned": 0, "mcp_calls": 0, "result_bytes": 0},
-    )
+    return _result_envelope(status, attempted, code, url)
+
+
+def _scrape_unsubscribe_urls(html: str | None, text: str | None) -> list[str]:
+    """Extract unsubscribe-link candidates from a message body.
+
+    Looks at every ``<a href="...">label</a>`` in the HTML body. A link
+    is a candidate if EITHER the URL OR the anchor text contains an
+    unsubscribe keyword (case-insensitive). Plain-text bodies are
+    scanned for bare URLs adjacent to an unsubscribe keyword.
+
+    Returns matches in source order, deduplicated.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _record(u: str) -> None:
+        if u.lower().startswith(("http://", "https://")) and u not in seen:
+            seen.add(u)
+            found.append(u)
+
+    if html:
+        for href, label in _ANCHOR_RE.findall(html):
+            haystack = (href + " " + label).lower()
+            if any(k in haystack for k in _UNSUB_KEYWORDS):
+                _record(href)
+
+    if text:
+        for line in text.splitlines():
+            low = line.lower()
+            if any(k in low for k in _UNSUB_KEYWORDS):
+                for token in line.split():
+                    token = token.strip(".,;:()[]<>\"'")
+                    if token.lower().startswith(("http://", "https://")):
+                        _record(token)
+
+    return found
+
+
+def _mailto_envelope(
+    to: str, subject: str, body: str, *, source: str
+) -> dict[str, Any]:
+    return {
+        "status": "mailto_returned_for_agent",
+        "mailto": {"to": to, "subject": subject, "body": body},
+        "attempted_methods": [],
+        "response_code": None,
+        "scraped_from": source,
+    }
 
 
 def _http_post(url: str, body: str, timeout_secs: float) -> int:
@@ -680,8 +765,7 @@ def _http_post(url: str, body: str, timeout_secs: float) -> int:
             return int(resp.status)
     except urllib.error.HTTPError as e:
         return int(e.code)
-    except urllib.error.URLError as e:
-        # Network failure looks like a 599 to keep the result shape stable.
+    except urllib.error.URLError:
         return 599
 
 
@@ -908,6 +992,27 @@ def _finalize_ranking(
 
 _BULK_DELETE_SELECTORS = {"from_sender", "from_domain", "list_id"}
 
+# Patterns that strongly suggest a message is bulk (newsletter / promo /
+# automated mailing) vs transactional (receipt / 1:1 correspondence).
+# We use these on the body text because cached search results don't
+# surface List-Id / List-Unsubscribe as top-level fields. This is
+# heuristic — when in doubt, the agent should sample-confirm with the
+# user before bulk-deleting.
+_BULK_BODY_HINTS = re.compile(
+    r"\bunsubscribe\b|\bopt[- ]out\b|\bmanage[ -]subscription\b|\bview in browser\b|"
+    r"\bpreferences\b|<a[^>]*unsubscribe",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_bulk(entry: dict[str, Any]) -> bool:
+    """Heuristic: does a cached search result look like bulk mass mail?"""
+    haystack = " ".join(
+        (entry.get(k) or "")
+        for k in ("body_text", "body_html", "subject")
+    )
+    return bool(_BULK_BODY_HINTS.search(haystack))
+
 
 @register("prepare-bulk-delete")
 def _prepare_bulk_delete(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
@@ -929,6 +1034,7 @@ def _prepare_bulk_delete(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     search_args.setdefault("value", selector.get("value", ""))
     search_args.setdefault("scope", request.get("scope", "inbox"))
     sample_size = int(request.get("sample_size", 5))
+    bulk_only = bool(request.get("bulk_only", False))
 
     client = McpClient(command=server_cfg["command"], env=server_cfg.get("env"))
     try:
@@ -943,36 +1049,59 @@ def _prepare_bulk_delete(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     payload = _extract_payload(tool_result)
     matches = payload.get("matches") if isinstance(payload, dict) else None
     if matches is None:
-        # Some servers return the list at the top level.
         matches = payload if isinstance(payload, list) else []
 
     folders: set[str] = set()
     total_bytes = 0
     samples: list[dict[str, Any]] = []
+    bulk_uids: list[int] = []
+    transactional_uids: list[int] = []
+    transactional_samples: list[dict[str, Any]] = []
+
     for entry in matches:
         folder = entry.get("folder", "INBOX")
         folders.add(folder)
         total_bytes += int(entry.get("size_bytes") or 0)
-        if len(samples) < sample_size:
-            samples.append(
-                {
-                    "uid": entry.get("uid"),
-                    "folder": folder,
-                    "subject": entry.get("subject"),
-                    "from": entry.get("from"),
-                    "date": entry.get("date"),
-                }
-            )
+        uid = entry.get("uid")
+        is_bulk = (not bulk_only) or _looks_bulk(entry)
+        sample_entry = {
+            "uid": uid,
+            "folder": folder,
+            "subject": entry.get("subject"),
+            "from": entry.get("from"),
+            "date": entry.get("date"),
+        }
+        if is_bulk:
+            if uid is not None:
+                bulk_uids.append(int(uid))
+            if len(samples) < sample_size:
+                samples.append(sample_entry)
+        else:
+            if uid is not None:
+                transactional_uids.append(int(uid))
+            if len(transactional_samples) < sample_size:
+                transactional_samples.append(sample_entry)
+
+    result = {
+        "dry_run": True,
+        "selector": selector,
+        "match_count": len(matches),
+        "folders": sorted(folders),
+        "samples": samples,
+        "estimated_storage_freed_bytes": total_bytes,
+        "bulk_uids": bulk_uids,
+        "bulk_count": len(bulk_uids),
+        "transactional_uids": transactional_uids,
+        "transactional_count": len(transactional_uids),
+        "transactional_samples": transactional_samples,
+        "bulk_only": bulk_only,
+        "bulk_detection_method": "body-keyword-heuristic"
+        if bulk_only
+        else "none (every match treated as bulk)",
+    }
 
     return (
-        {
-            "dry_run": True,
-            "selector": selector,
-            "match_count": len(matches),
-            "folders": sorted(folders),
-            "samples": samples,
-            "estimated_storage_freed_bytes": total_bytes,
-        },
+        result,
         {
             "messages_scanned": len(matches),
             "mcp_calls": 1,

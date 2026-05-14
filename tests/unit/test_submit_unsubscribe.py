@@ -196,3 +196,109 @@ def test_failed_response_code_marks_failed_status() -> None:
         env = run_unsub({"list_unsubscribe_url": _url_for(srv, "/missing")})
     assert env["result"]["status"] == "failed"
     assert env["result"]["response_code"] == 404
+
+
+# ---------- body-scraping fallback (no RFC 8058 header) ------------------
+
+
+def test_extracts_unsubscribe_url_from_body_html_anchor() -> None:
+    with http_capture() as srv:
+        url = _url_for(srv, "/scrape/1")
+        html = (
+            "<html><body>"
+            "<p>Buy more stuff</p>"
+            f'<a href="{url}">Unsubscribe from these emails</a>'
+            "</body></html>"
+        )
+        env = run_unsub({"body_html": html})
+    assert env["status"] == "ok", env
+    assert env["result"]["status"] == "submitted"
+    assert env["result"]["scraped_from"] == "body_html"
+    captured = srv.captured  # type: ignore[attr-defined]
+    assert any(c["path"].startswith("/scrape/1") for c in captured)
+
+
+def test_scraper_matches_href_containing_unsubscribe_anywhere() -> None:
+    """The match works on the href URL itself, not just the anchor text."""
+    with http_capture() as srv:
+        url = _url_for(srv, "/api/unsubscribe?token=abc")
+        html = f'<a href="{url}">click here</a>'
+        env = run_unsub({"body_html": html})
+    assert env["result"]["status"] == "submitted"
+
+
+def test_scraper_matches_opt_out_keyword() -> None:
+    with http_capture() as srv:
+        url = _url_for(srv, "/opt-out/123")
+        html = f'<a href="{url}">opt out of list</a>'
+        env = run_unsub({"body_html": html})
+    assert env["result"]["status"] == "submitted"
+
+
+def test_scraper_skips_unrelated_links() -> None:
+    """Don't fire on every <a href=...> in the body — only unsubscribe-like ones."""
+    with http_capture() as srv:
+        env = run_unsub(
+            {
+                "body_html": (
+                    f'<a href="{_url_for(srv, "/home")}">Home</a>'
+                    f'<a href="{_url_for(srv, "/login")}">Login</a>'
+                ),
+                "from_domain": "example.com",
+            }
+        )
+    # No unsubscribe link found in body. Should fall back to mailto.
+    assert env["result"]["status"] == "mailto_returned_for_agent"
+    assert env["result"]["mailto"]["to"] == "unsubscribe@example.com"
+
+
+def test_falls_back_to_mailto_from_domain_when_no_scrape_match() -> None:
+    env = run_unsub(
+        {
+            "body_html": "<p>Boring promotional body, no link</p>",
+            "from_domain": "shaggymax.example",
+        }
+    )
+    assert env["status"] == "ok"
+    assert env["result"]["status"] == "mailto_returned_for_agent"
+    assert env["result"]["mailto"]["to"] == "unsubscribe@shaggymax.example"
+    assert env["result"]["scraped_from"] == "from_domain_fallback"
+
+
+def test_scrape_tries_first_url_then_falls_back_to_second() -> None:
+    """First scraped URL POST fails; sidecar tries the next one."""
+    with http_capture(response_code=500) as bad_srv, http_capture() as good_srv:
+        bad_url = _url_for(bad_srv, "/bad-unsub")
+        good_url = _url_for(good_srv, "/good-unsub")
+        html = (
+            f'<a href="{bad_url}">unsubscribe</a>'
+            f'<a href="{good_url}">also unsubscribe</a>'
+        )
+        env = run_unsub({"body_html": html, "fall_back_to_get": True})
+    # Second URL ended up succeeding.
+    assert env["result"]["status"] == "submitted"
+    assert len(env["result"]["scraped_candidates"]) == 2
+
+
+def test_no_scrape_match_no_domain_is_an_error() -> None:
+    env = run_unsub({"body_html": "<p>boring</p>"})
+    assert env["status"] == "error"
+    assert env["error"]["code"] == "bad_request"
+
+
+def test_explicit_list_unsubscribe_url_still_takes_precedence_over_body() -> None:
+    """When the message has a real List-Unsubscribe header, use that — don't
+    scrape, don't fall back."""
+    with http_capture() as header_srv, http_capture() as body_srv:
+        env = run_unsub(
+            {
+                "list_unsubscribe_url": _url_for(header_srv, "/header"),
+                "body_html": (
+                    f'<a href="{_url_for(body_srv, "/body-unsub")}">unsubscribe</a>'
+                ),
+            }
+        )
+    # Only the header URL was hit; the body URL was untouched.
+    assert env["result"]["status"] == "submitted"
+    assert len(header_srv.captured) == 1  # type: ignore[attr-defined]
+    assert len(body_srv.captured) == 0  # type: ignore[attr-defined]

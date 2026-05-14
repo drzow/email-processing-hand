@@ -366,10 +366,11 @@ def _handle(req: dict) -> None:
                     {
                         "uid": 100,
                         "folder": "INBOX",
-                        "subject": "May sale",
+                        "subject": "May sale — unsubscribe",
                         "from": "marketing@vendor.com",
                         "date": "Mon, 01 Apr 2026 09:30:00 -0500",
                         "size_bytes": 11000,
+                        "body_text": "Get 50% off. To unsubscribe click here.",
                     },
                     {
                         "uid": 101,
@@ -378,14 +379,60 @@ def _handle(req: dict) -> None:
                         "from": "marketing@vendor.com",
                         "date": "Sun, 01 Mar 2026 09:30:00 -0500",
                         "size_bytes": 12000,
+                        "body_html": "<p>Sale!</p><a href='x'>Unsubscribe</a>",
                     },
                     {
                         "uid": 102,
                         "folder": "Archive",
-                        "subject": "March sale",
+                        "subject": "Order receipt #ABC-123",
                         "from": "marketing@vendor.com",
                         "date": "Wed, 01 Feb 2026 09:30:00 -0500",
                         "size_bytes": 9000,
+                        "body_text": "Your order has shipped. Tracking: 1Z...",
+                    },
+                ]
+            elif args.get("value") == "@shaggymax.example":
+                # 5 messages: 4 bulk (newsletter), 1 transactional (receipt).
+                hits = [
+                    {
+                        "uid": 200, "folder": "INBOX",
+                        "subject": "Spring Newsletter",
+                        "from": "news@shaggymax.example",
+                        "date": "Mon, 01 May 2026 09:00:00 -0500",
+                        "size_bytes": 8000,
+                        "body_text": "Big spring savings. Unsubscribe here.",
+                    },
+                    {
+                        "uid": 201, "folder": "INBOX",
+                        "subject": "Summer deals",
+                        "from": "news@shaggymax.example",
+                        "date": "Mon, 01 Apr 2026 09:00:00 -0500",
+                        "size_bytes": 8500,
+                        "body_html": "<a href='#'>unsubscribe</a> from list",
+                    },
+                    {
+                        "uid": 202, "folder": "Archive",
+                        "subject": "Order #5512 confirmation",
+                        "from": "orders@shaggymax.example",
+                        "date": "Tue, 12 Feb 2026 14:00:00 -0500",
+                        "size_bytes": 4000,
+                        "body_text": "Thanks for your order #5512.",
+                    },
+                    {
+                        "uid": 203, "folder": "Archive",
+                        "subject": "Black Friday",
+                        "from": "news@shaggymax.example",
+                        "date": "Fri, 27 Nov 2025 10:00:00 -0500",
+                        "size_bytes": 9000,
+                        "body_text": "70% off everything. opt-out at preferences.",
+                    },
+                    {
+                        "uid": 204, "folder": "Archive",
+                        "subject": "Holiday catalogue",
+                        "from": "news@shaggymax.example",
+                        "date": "Tue, 01 Dec 2024 10:00:00 -0500",
+                        "size_bytes": 12000,
+                        "body_html": "<p>shop now</p><a>unsubscribe</a>",
                     },
                 ]
             else:

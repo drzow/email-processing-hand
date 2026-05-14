@@ -70,6 +70,50 @@ def test_rejects_unknown_selector_kind() -> None:
     assert "selector.kind" in env["error"]["message"]
 
 
+def test_bulk_only_separates_bulk_from_transactional() -> None:
+    """With bulk_only=true, the subcommand returns bulk_uids (messages
+    with an unsubscribe link in the body) separately from
+    transactional_uids (no such link — receipts, etc.). The agent
+    deletes only the bulk set."""
+    env = run_prep(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "search_tool": "search_by_sender",
+            "selector": {"kind": "from_domain", "value": "@shaggymax.example"},
+            "scope": "all_folders",
+            "sample_size": 5,
+            "bulk_only": True,
+        }
+    )
+    assert env["status"] == "ok", env
+    r = env["result"]
+    # Fixture has 5 matches: 4 newsletters (200, 201, 203, 204) with
+    # unsubscribe cues + 1 receipt (202) without.
+    assert sorted(r["bulk_uids"]) == [200, 201, 203, 204]
+    assert sorted(r["transactional_uids"]) == [202]
+    assert r["bulk_count"] == 4
+    assert r["transactional_count"] == 1
+    # `match_count` keeps reporting the unfiltered total for backward compat.
+    assert r["match_count"] == 5
+
+
+def test_bulk_only_false_returns_all_uids_as_bulk_for_backward_compat() -> None:
+    env = run_prep(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "search_tool": "search_by_sender",
+            "selector": {"kind": "from_domain", "value": "@shaggymax.example"},
+            "scope": "all_folders",
+        }
+    )
+    r = env["result"]
+    # Without bulk_only the subcommand doesn't split; bulk_uids contains
+    # everything and transactional_uids is empty.
+    assert r["match_count"] == 5
+    assert "bulk_uids" not in r or len(r.get("bulk_uids", [])) == 5
+    assert r["dry_run"] is True
+
+
 def test_propagates_mcp_error() -> None:
     env = run_prep(
         {

@@ -843,13 +843,90 @@ For each bucket, the concrete tool calls are below. After execution: update `tra
 
 #### Bucket 2 (UnsubAndBlock) — sender-or-domain, INBOX + Archive
 
-1. From the proposal's `options`, get `list_unsubscribe_url` and/or `list_unsubscribe_mailto` (these came from the classify-context blob, which lifted them off the message headers). If neither is present in the cluster's sample message, look at a few more messages from this sender via list_cached_emails until one is found, or fall back to mailto:unsubscribe@<domain>.
-2. shell_exec `python3 /home/zow/projects/email-processing-hand/tools/scan.py submit-unsubscribe` with the URL / mailto.
-3. For mailto: case, the sidecar returns to/subject/body — agent sends via the email MCP's `send_email` tool (or `draft_email` if that's what's available; check at run-time via tools/list).
-4. Then do the Bucket 1 flow: resolve + delete across INBOX + Archive.
-5. Upsert deterministic rule with `bucket = "UnsubAndBlock"`.
+**Read this carefully — the time-window semantics are non-obvious.**
+
+The `unsubscribe_lookback_months` setting (default 4) is used ONLY to
+decide IF the user has already unsubscribed. The delete scope is
+UNBOUNDED in time and covers ALL bulk mail from this sender across
+INBOX + Archive, sparing transactional mail (receipts, order
+confirmations, support replies from the same address).
+
+1. **Decide whether to submit an unsubscribe request.** Search the
+   sender's mail within the last `unsubscribe_lookback_months` months.
+   If ZERO messages found in that window → user already unsubscribed
+   (or sender stopped) → skip step 2. If ≥ 1 found → step 2.
+
+2. **Submit the unsubscribe request via the sidecar.** Gather every
+   pathway available, and pass them all to `submit-unsubscribe` —
+   it tries them in priority order:
+   ```
+   shell_exec python3 /home/zow/projects/email-processing-hand/tools/scan.py submit-unsubscribe
+     stdin:
+       {
+         "list_unsubscribe_url": "<from header if present>",
+         "list_unsubscribe_post": "List-Unsubscribe=One-Click",
+         "list_unsubscribe_mailto": "<from header if present>",
+         "body_html": "<the message's HTML body, for the scraper>",
+         "body_text": "<the message's plaintext body>",
+         "from_domain": "<sender's domain, for the mailto fallback>",
+         "fall_back_to_get": true
+       }
+   ```
+   The sidecar will:
+   - Try the RFC 8058 POST first if both URL + post token are present.
+   - Else GET the List-Unsubscribe URL.
+   - Else send the List-Unsubscribe mailto (sidecar returns to/subject/body; you send via the email MCP server).
+   - Else scrape `body_html` for anchor tags whose href OR label contains "unsubscribe" / "opt-out" / "preferences" and try them.
+   - Else scrape `body_text` for bare unsubscribe URLs.
+   - Else (last resort) return a mailto envelope for `unsubscribe@<from_domain>`.
+
+   If the result is `{"status": "mailto_returned_for_agent", ...}`,
+   you must send the mailto via `mcp_rustymail_*_send_email` (or
+   draft + send) — the sidecar deliberately doesn't ship SMTP itself.
+
+3. **Find ALL bulk mail from this sender (unbounded time).**
+   ```
+   shell_exec ... prepare-bulk-delete
+     stdin:
+       {
+         "mcp_server": {...},
+         "search_tool": "search_by_sender",
+         "selector": {"kind": "from_sender", "value": "<sender>"},
+         "scope": "all_folders",
+         "bulk_only": true,
+         "sample_size": 8
+       }
+   ```
+   The response splits the matches into `bulk_uids` (newsletter-style
+   messages — body shows "unsubscribe" / "opt-out" / "preferences" /
+   "view in browser") and `transactional_uids` (receipts, order
+   confirmations, support replies — no unsubscribe cues). The bulk
+   detection is body-keyword-heuristic — surface counts to the user
+   if they're surprisingly skewed (e.g., 0 transactional looks too
+   aggressive; many transactional looks under-classified).
+
+4. **Delete the bulk mail. Keep the transactional.**
+   Group `bulk_uids` by folder (from the samples — or look up via a
+   second search if needed):
+   ```
+   for (folder, uids) in by_folder(bulk_uids):
+       mcp_rustymail_delete_messages(account_id=<acct>, folder=<folder>, uids="<csv>")
+   ```
+   ⚠ **`delete_messages` IS an exposed rustymail MCP tool.** You
+   verified it earlier in this same session. If you find yourself
+   about to write "delete_messages is not exposed", you are wrong —
+   re-check via `tools/list`.
+
+5. Upsert deterministic rule with `bucket = "UnsubAndBlock"`,
+   `options.kept_transactional = N` so the next cycle remembers what
+   was spared. Persist `options.notes` if the user provided directives.
+
 6. Flag Sieve regen.
-7. totals: `unsubscribes_submitted += 1`, `messages_deleted += N`, `rules_learned += 1`.
+
+7. totals: `unsubscribes_submitted += 1` (if step 2 ran),
+   `messages_deleted += len(bulk_uids)`,
+   `messages_kept_transactional += len(transactional_uids)`,
+   `rules_proposed += 1`.
 
 #### Bucket 3 (Filter) — sender-scoped, workflow scope
 
