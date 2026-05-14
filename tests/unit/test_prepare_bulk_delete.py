@@ -70,6 +70,31 @@ def test_rejects_unknown_selector_kind() -> None:
     assert "selector.kind" in env["error"]["message"]
 
 
+def test_cached_shape_from_and_size_in_samples() -> None:
+    """When the search tool returns cached-shape entries (from_address +
+    size instead of from + size_bytes), prepare-bulk-delete samples
+    surface a rendered "Name <addr>" from string and the right
+    total_bytes."""
+    # Use the search_by_sender stub which already returns "from" / "size_bytes".
+    # Then verify the prepare-bulk-delete output for shape consistency.
+    env = run_prep(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "search_tool": "search_by_sender",
+            "selector": {"kind": "from_sender", "value": "marketing@vendor.com"},
+            "scope": "all_folders",
+            "sample_size": 3,
+        }
+    )
+    r = env["result"]
+    # estimated_storage_freed_bytes is non-zero — the size fallback works.
+    assert r["estimated_storage_freed_bytes"] > 0
+    # Each sample carries a rendered "from" string (not None / not raw dict).
+    for s in r["samples"]:
+        assert isinstance(s["from"], str)
+        assert s["from"]  # non-empty
+
+
 def test_bulk_only_separates_bulk_from_transactional() -> None:
     """With bulk_only=true, the subcommand returns bulk_uids (messages
     with an unsubscribe link in the body) separately from

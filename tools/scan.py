@@ -266,6 +266,80 @@ def _fetch_batch(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Message-shape normalizers. Real rustymail returns different field
+# names depending on which list/search tool you call:
+#
+#   list_cached_emails / search_cached_emails / search_by_domain →
+#       from_address (str), from_name (str), to_addresses ([str]),
+#       cc_addresses ([str]), size (int)
+#
+#   raw RFC 5322 parsing in lib.headers → "from", "to", "cc"
+#       (each "Name <addr>, ..." strings) and "size_bytes" set by
+#       fetch-batch from get_email_by_uid's payload.
+#
+# These helpers normalize both shapes so the per-sender / per-recipient
+# code doesn't care which list tool fed it.
+# ---------------------------------------------------------------------------
+
+
+def _entry_from_addrs(entry: dict[str, Any], parse_address_list: Any) -> list[dict[str, str]]:
+    """Return [{name, addr}, ...] for the From of a message entry."""
+    raw_from = entry.get("from") or ""
+    if raw_from:
+        return parse_address_list(raw_from)
+    fa = entry.get("from_address") or ""
+    fn = entry.get("from_name") or ""
+    if not fa or "@" not in fa:
+        return []
+    return [{"addr": fa.lower(), "name": fn or ""}]
+
+
+def _entry_addr_list(
+    entry: dict[str, Any], field: str, parse_address_list: Any
+) -> list[dict[str, str]]:
+    """Return [{name, addr}, ...] for to/cc/etc. on a message entry.
+
+    Honors the raw form (``entry["to"]`` as a comma-joined string) AND
+    the cached form (``entry["to_addresses"]`` as a ``[str]``).
+    """
+    val = entry.get(field)
+    if val:
+        if isinstance(val, list):
+            return [
+                {"addr": a.lower(), "name": ""}
+                for a in val
+                if isinstance(a, str) and "@" in a
+            ]
+        return parse_address_list(val)
+    val = entry.get(f"{field}_addresses")
+    if isinstance(val, list):
+        return [
+            {"addr": a.lower(), "name": ""}
+            for a in val
+            if isinstance(a, str) and "@" in a
+        ]
+    return []
+
+
+def _entry_size(entry: dict[str, Any]) -> int:
+    """Message size in bytes, falling back across shape names."""
+    return int(entry.get("size_bytes") or entry.get("size") or 0)
+
+
+def _entry_from_display(entry: dict[str, Any]) -> str:
+    """Render the From: as a single ``"Name <addr>"`` (or addr-only) string
+    for samples / display rows. Empty string if unset."""
+    f = entry.get("from")
+    if f:
+        return f
+    fa = entry.get("from_address") or ""
+    fn = entry.get("from_name") or ""
+    if fa and fn:
+        return f"{fn} <{fa}>"
+    return fa or ""
+
+
 def _paginate_messages(
     client: Any,
     tool_name: str,
@@ -523,7 +597,7 @@ def _contacts_bootstrap(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
                 acct_summary["messages_scanned"] += 1
                 total_scanned += 1
                 for field in ("to", "cc"):
-                    for entry in parse_address_list(msg.get(field) or ""):
+                    for entry in _entry_addr_list(msg, field, parse_address_list):
                         addr = entry["addr"]
                         if not addr:
                             continue
@@ -914,8 +988,7 @@ def _accumulate(
     parse_address_list: Any,
 ) -> None:
     """Add one message entry into the per-sender aggregation."""
-    raw_from = entry.get("from") or ""
-    addrs = parse_address_list(raw_from)
+    addrs = _entry_from_addrs(entry, parse_address_list)
     if not addrs:
         return
     addr = addrs[0]["addr"]
@@ -933,13 +1006,14 @@ def _accumulate(
             "oldest": None,
             "newest": None,
             "folders": set(),
+            "sample_uids": [],
         },
     )
     if not bucket["name"] and name:
         bucket["name"] = name
 
     bucket["message_count"] += 1
-    bucket["total_bytes"] += int(entry.get("size_bytes") or 0)
+    bucket["total_bytes"] += _entry_size(entry)
     subj = entry.get("subject") or ""
     if subj and subj not in bucket["subject_seen"]:
         bucket["subject_seen"].add(subj)
@@ -951,6 +1025,9 @@ def _accumulate(
         if bucket["newest"] is None or date > bucket["newest"]:
             bucket["newest"] = date
     bucket["folders"].add(folder)
+    uid = entry.get("uid")
+    if uid is not None and len(bucket["sample_uids"]) < 3:
+        bucket["sample_uids"].append(uid)
 
 
 def _finalize_ranking(
@@ -977,6 +1054,7 @@ def _finalize_ranking(
                 "oldest": r["oldest"],
                 "newest": r["newest"],
                 "folders": sorted(r["folders"]),
+                "sample_uids": r.get("sample_uids", []),
             }
         )
     return out
@@ -1061,14 +1139,14 @@ def _prepare_bulk_delete(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     for entry in matches:
         folder = entry.get("folder", "INBOX")
         folders.add(folder)
-        total_bytes += int(entry.get("size_bytes") or 0)
+        total_bytes += _entry_size(entry)
         uid = entry.get("uid")
         is_bulk = (not bulk_only) or _looks_bulk(entry)
         sample_entry = {
             "uid": uid,
             "folder": folder,
             "subject": entry.get("subject"),
-            "from": entry.get("from"),
+            "from": _entry_from_display(entry),
             "date": entry.get("date"),
         }
         if is_bulk:

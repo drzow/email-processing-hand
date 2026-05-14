@@ -183,6 +183,41 @@ FOLDER_MESSAGES: dict[str, list[dict]] = {
         },
     ],
     "BigBox": _BIG_BOX,
+    # Mirrors real rustymail list_cached_emails output shape:
+    # from_address / from_name / to_addresses / cc_addresses / size
+    # (instead of from / to / cc / size_bytes).
+    "CachedShape": [
+        {
+            "uid": 800,
+            "from_address": "sam@acme.com",
+            "from_name": "Sam Long",
+            "to_addresses": ["alice@scalesology.com"],
+            "cc_addresses": [],
+            "subject": "Q3 plan",
+            "date": "2026-05-01T09:00:00Z",
+            "size": 5000,
+        },
+        {
+            "uid": 801,
+            "from_address": "sam@acme.com",
+            "from_name": "Sam Long",
+            "to_addresses": ["alice@scalesology.com"],
+            "cc_addresses": ["bob@acme.com"],
+            "subject": "Re: Q3 plan",
+            "date": "2026-05-02T09:00:00Z",
+            "size": 6000,
+        },
+        {
+            "uid": 802,
+            "from_address": "carol@partner.com",
+            "from_name": "",
+            "to_addresses": ["alice@scalesology.com"],
+            "cc_addresses": [],
+            "subject": "Intro",
+            "date": "2026-05-03T09:00:00Z",
+            "size": 3500,
+        },
+    ],
     "Sent Items": [
         {
             "uid": 600,

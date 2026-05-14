@@ -205,6 +205,29 @@ def test_rejects_unknown_metric() -> None:
     assert "metric" in env["error"]["message"]
 
 
+def test_cached_shape_from_address_and_size_aggregate_correctly() -> None:
+    """rustymail's list_cached_emails returns from_address/from_name + size
+    instead of raw 'from' / 'size_bytes'. The sidecar must handle both."""
+    env = run_rank(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "list_tool": "list_emails_in_folder",
+            "folders": ["CachedShape"],
+            "metric": "count",
+            "limit": 10,
+        }
+    )
+    by_sender = {r["sender"]: r for r in env["result"]["ranking"]}
+    # Sam appears twice, Carol once.
+    assert by_sender["sam@acme.com"]["message_count"] == 2
+    assert by_sender["sam@acme.com"]["name"] == "Sam Long"
+    assert by_sender["sam@acme.com"]["total_bytes"] == 11000  # 5000 + 6000
+    assert by_sender["carol@partner.com"]["message_count"] == 1
+    assert by_sender["carol@partner.com"]["total_bytes"] == 3500
+    # sample_uids surfaced for hallucination guard.
+    assert set(by_sender["sam@acme.com"]["sample_uids"]).issubset({800, 801})
+
+
 def test_pagination_aggregates_across_multiple_pages() -> None:
     """The BigBox fixture has 12 messages from 4 senders. With page_size=5
     the sidecar must call the list tool 3 times (5 + 5 + 2) and aggregate

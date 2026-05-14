@@ -189,6 +189,32 @@ def test_requires_accounts_list() -> None:
     assert "accounts" in env["error"]["message"]
 
 
+def test_cached_shape_to_cc_arrays_are_normalized() -> None:
+    """list_cached_emails returns to_addresses/cc_addresses as arrays of
+    bare email strings — the sidecar must treat them like a To/Cc
+    address list and credit each recipient to the contact map."""
+    env = run_contacts(
+        {
+            "mcp_server": _mock_server_cfg(),
+            "list_tool": "list_emails_in_folder",
+            "accounts": [
+                {"account_id": "alice@scalesology.com", "sent_folder": "CachedShape"}
+            ],
+        }
+    )
+    contacts = env["result"]["contacts"]
+    # Sam appears as To: in both messages 800 + 801; should be counted.
+    assert "sam@acme.com" not in contacts  # sam is the FROM, not in to/cc
+    # Wait, no — the contacts-bootstrap target is OUR sent folder. In the
+    # CachedShape fixture, from_address is sam@ (incoming-style data), so
+    # if we were treating it as our Sent box we'd record To: alice@ etc.
+    # Use what's actually in to_addresses + cc_addresses:
+    assert "alice@scalesology.com" in contacts
+    assert contacts["alice@scalesology.com"]["message_count"] == 3  # all 3 msgs
+    assert "bob@acme.com" in contacts  # cc on message 801
+    assert contacts["bob@acme.com"]["message_count"] == 1
+
+
 def test_pagination_walks_all_pages_of_sent_folder() -> None:
     """BigBox is the fixture's paginated-test folder. With page_size=5
     the sidecar must call list_emails_in_folder 3 times before it sees
