@@ -711,8 +711,9 @@ The agent that previously ran this hand (Haiku) fabricated entire emails when it
 
 If `training_state.pending_proposal` is set, the current user message is the response to it. Parse:
 
-- Empty / Enter / "accept" / "yes" / "y" → ACCEPT (use the proposal's bucket).
-- A bucket name (Filter, Blacklist, etc.) → OVERRIDE (use that bucket, log corrected_count++).
+- "y" / "yes" / "accept" / "ok" / "go" / "next" → ACCEPT (use the proposal's bucket).
+- A bucket name (Filter, Blacklist, etc.) → if it EQUALS the proposal's bucket (case-insensitive), treat as ACCEPT (no correction logged). Otherwise OVERRIDE (use that bucket, log corrected_count++).
+- (The dashboard chat does NOT allow empty submissions — do not instruct the user to "press Enter" anywhere.)
 - "skip" → SKIP (no action; increment skipped).
 - "pause" / "abort" → set status accordingly, persist, exit.
 - "explain" → render the classifier's `reasoning` field; do NOT advance the loop; re-prompt for decision.
@@ -766,8 +767,10 @@ Persist to `training_state.pending_proposal`. Reply to user in dashboard chat:
 
 Proposed: **<bucket>** (confidence <c>) — <reasoning>
 
-  <Enter>      accept
-  <bucket>     override (e.g., "Filter", "Skip", "Blacklist")
+  y / yes / accept / next   accept the proposal
+  <bucket>                  override (e.g., "Filter", "Skip", "Blacklist")
+                            — typing the SAME bucket as the proposal
+                              is treated as accept, not override
   skip         move on without acting
   explain      see the classifier's reasoning in detail
   pause        save progress and stop
