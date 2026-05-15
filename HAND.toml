@@ -699,7 +699,23 @@ Each user message during an active backlog session triggers ONE iteration of thi
    ```
 
    To build the `queue`:
-   - For `top_count_*` / `top_volume_*`: shell_exec `python3 /home/zow/projects/email-processing-hand/tools/scan.py rank-senders` with `metric`, `scope`, `limit`. Each ranking entry becomes a queue item shaped `{"kind": "sender_cluster", "sender": addr, "name": name, "message_count": n, "total_bytes": b, "sample_subjects": [...], "folders": [...]}`.
+   - For `top_count_*` / `top_volume_*`: shell_exec `python3 /home/zow/projects/email-processing-hand/tools/scan.py rank-senders` with at minimum:
+     ```json
+     {
+       "mcp_server": {"command": [
+         "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio",
+         "--backend-url", "http://localhost:9437/mcp"
+       ]},
+       "account_id": "<the account_id from mcp_rustymail_list_accounts>",
+       "folders": ["INBOX"],
+       "metric": "count" or "volume",
+       "limit": <N>,
+       "page_size": 200
+     }
+     ```
+     Sidecar defaults: `list_tool = "list_cached_emails"`, `list_folders_tool = "list_folders_hierarchical"`, `page_size = 500`. `account_id` is propagated automatically into the list-tool args. The paginator retries on rate-limit responses (rustymail caps at 60 req/min).
+
+     Each ranking entry becomes a queue item shaped `{"kind": "sender_cluster", "sender": addr, "name": name, "message_count": n, "total_bytes": b, "sample_subjects": [...], "sample_uids": [u1, u2, u3], "folders": [...]}`. The `sample_uids` field MUST be present and non-empty — that's the hallucination guard.
    - For `recent_inbox` / `oldest_inbox`: shell_exec `fetch-batch` with `selector.kind="uids"` plus a list_emails_by_flag call to discover the N most recent / oldest UIDs. Each message becomes a queue item shaped `{"kind": "message", "uid": ..., "folder": ..., "headers": {...}, "body_text": "..."}`.
 
 ### ⚠ HALLUCINATION GUARD — read this every iteration

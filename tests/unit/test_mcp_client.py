@@ -48,6 +48,17 @@ def test_call_tool_unknown_tool_is_an_error() -> None:
     assert "does-not-exist" in str(excinfo.value)
 
 
+def test_call_tool_raises_when_result_carries_is_error_true() -> None:
+    """Real rustymail returns id-matched 'success' responses with
+    isError=true in the result envelope when a tool fails (e.g.,
+    unknown tool name). Treat those as errors, not empty success."""
+    with _client() as c:
+        with pytest.raises(McpClientError) as excinfo:
+            c.call_tool("tool_returns_is_error", {})
+    msg = str(excinfo.value)
+    assert "isError" in msg or "Tool execution failed" in msg
+
+
 def test_get_email_by_uid_returns_canned_message() -> None:
     with _client() as c:
         result = c.call_tool("get_email_by_uid", {"folder": "INBOX", "uid": 1})

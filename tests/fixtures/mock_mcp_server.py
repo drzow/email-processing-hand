@@ -343,6 +343,18 @@ def _handle(req: dict) -> None:
         if name == "raise_error":
             _error(req_id, args.get("code", -32603), args.get("message", "boom"))
             return
+        if name == "tool_returns_is_error":
+            # Mimics rustymail's behavior when an unknown tool is called:
+            # a "successful" JSON-RPC response whose result has isError=true.
+            # We must NOT silently treat this as success.
+            _result(
+                req_id,
+                {
+                    "content": [{"type": "text", "text": "Tool execution failed"}],
+                    "isError": True,
+                },
+            )
+            return
         if name == "list_folders":
             _result(
                 req_id,

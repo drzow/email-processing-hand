@@ -95,8 +95,28 @@ class McpClient:
         The server's result for ``tools/call`` is typically:
 
         ``{"content": [{"type": "text", "text": "..."}], "isError": false}``
+
+        When the server returns ``isError: true`` (e.g., an unknown tool
+        name, or a permission failure), we raise McpClientError with the
+        embedded text. Silent failure is the wrong behavior — paginators
+        and other consumers would otherwise treat "no messages" the same
+        as "tool blew up", and a failed real-account run would look like
+        an empty inbox.
         """
-        return self._transact("tools/call", {"name": name, "arguments": arguments})
+        result = self._transact("tools/call", {"name": name, "arguments": arguments})
+        if isinstance(result, dict) and result.get("isError"):
+            content = result.get("content") or []
+            text_parts: list[str] = []
+            for chunk in content:
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    t = chunk.get("text")
+                    if t:
+                        text_parts.append(str(t))
+            details = "; ".join(text_parts) or "no detail"
+            raise McpClientError(
+                f"tool {name!r} returned isError=true: {details}"
+            )
+        return result
 
     def close(self) -> None:
         if self._proc is None:
@@ -158,14 +178,29 @@ class McpClient:
                 f"non-JSON response from {method}: {line!r} ({e})"
             ) from e
 
-        if response.get("id") != request_id:
-            raise McpClientError(
-                f"id mismatch for {method}: sent {request_id}, got {response.get('id')}"
-            )
+        # Surface error responses FIRST, even when id is missing/null —
+        # many servers omit id on synchronous errors (rustymail's rate-
+        # limit response is one example). Strict id-matching only
+        # matters for successful responses.
         if "error" in response:
             err = response["error"]
+            if isinstance(err, str):
+                # Some servers (rustymail) send error+message at top level
+                # instead of a structured {code, message} object.
+                msg = response.get("message") or err
+                retry_after = response.get("retry_after")
+                detail = f"{err}: {msg}"
+                if retry_after is not None:
+                    detail += f" (retry_after={retry_after}s)"
+                raise McpClientError(f"server error on {method}: {detail}")
             raise McpClientError(
-                f"server error on {method}: code={err.get('code')} {err.get('message')}"
+                f"server error on {method}: "
+                f"code={err.get('code')} {err.get('message')}"
+            )
+        if response.get("id") != request_id:
+            raise McpClientError(
+                f"id mismatch for {method}: sent {request_id}, "
+                f"got {response.get('id')}; response={response!r}"
             )
         return response.get("result", {})
 

@@ -347,6 +347,7 @@ def _paginate_messages(
     *,
     page_size: int = 500,
     max_pages: int = 200,
+    rate_limit_retries: int = 5,
 ) -> list[dict[str, Any]]:
     """Call ``tool_name`` repeatedly with rising ``offset`` until the page
     comes back smaller than ``page_size`` (or we've seen ``total``).
@@ -357,7 +358,14 @@ def _paginate_messages(
     ``max_pages`` is a defense in case a buggy server returns full pages
     forever — we cap at 200 * page_size = 100k messages by default, which
     is well above any realistic single-folder count.
+
+    ``rate_limit_retries`` is how many times we'll back off and retry
+    when the server returns a ``rate_limit_exceeded`` style error. The
+    sleep duration comes from the error's ``retry_after`` field when
+    present, otherwise 5 seconds.
     """
+    import time as _time
+
     from lib.mcp_client import McpClientError
 
     out: list[dict[str, Any]] = []
@@ -368,10 +376,30 @@ def _paginate_messages(
         args = dict(base_args)
         args["limit"] = page_size
         args["offset"] = offset
-        try:
-            tool_result = client.call_tool(tool_name, args)
-        except McpClientError:
-            raise
+
+        retries_left = rate_limit_retries
+        while True:
+            try:
+                tool_result = client.call_tool(tool_name, args)
+                break
+            except McpClientError as e:
+                msg = str(e).lower()
+                if "rate_limit" in msg or "rate limit" in msg:
+                    if retries_left <= 0:
+                        raise
+                    retries_left -= 1
+                    # Parse retry_after from the error message if present;
+                    # else default to 5s. Cap at 60s.
+                    delay = 5
+                    m = re.search(r"retry_after=(\d+)", str(e))
+                    if not m:
+                        m = re.search(r"retry after (\d+)", msg)
+                    if m:
+                        delay = min(int(m.group(1)) + 1, 60)
+                    _time.sleep(delay)
+                    continue
+                raise
+
         payload = _extract_payload(tool_result)
         if isinstance(payload, dict):
             messages = payload.get("messages") or []
@@ -382,8 +410,6 @@ def _paginate_messages(
         else:
             messages = []
         out.extend(messages)
-        # Termination: under-full page, OR we know `total` and we've
-        # reached it, OR we got zero messages.
         if len(messages) < page_size:
             break
         if seen_total is not None and len(out) >= seen_total:
@@ -554,7 +580,7 @@ def _contacts_bootstrap(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
             "bad_request",
             "accounts list is required: [{account_id, sent_folder}, ...]",
         )
-    list_tool = request.get("list_tool", "list_emails_in_folder")
+    list_tool = request.get("list_tool", "list_cached_emails")
     since_cutoff = request.get("since")  # ISO-8601 string or None
 
     contacts: dict[str, dict[str, Any]] = {}
@@ -894,9 +920,17 @@ def _rank_senders(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
             f"metric must be one of {sorted(_RANK_METRICS)}; got {metric!r}",
         )
 
-    list_tool = request.get("list_tool", "list_emails_in_folder")
-    list_tool_args = request.get("list_tool_args") or {}
-    list_folders_tool = request.get("list_folders_tool", "list_folders")
+    # Default to rustymail's real tool names. The mock server understands
+    # both list_cached_emails and list_emails_in_folder.
+    list_tool = request.get("list_tool", "list_cached_emails")
+    list_tool_args = dict(request.get("list_tool_args") or {})
+    # account_id is required by rustymail's list_cached_emails. Accept it
+    # as a top-level field so the agent doesn't have to know about
+    # list_tool_args plumbing; merge into list_tool_args.
+    account_id = request.get("account_id")
+    if account_id and "account_id" not in list_tool_args:
+        list_tool_args["account_id"] = account_id
+    list_folders_tool = request.get("list_folders_tool", "list_folders_hierarchical")
     limit = int(request.get("limit", 50))
     sample_subjects_max = int(request.get("sample_subjects_max", 3))
     cutoff = request.get("exclude_already_processed_until")
