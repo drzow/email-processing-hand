@@ -508,6 +508,35 @@ def _handle(req: dict) -> None:
                 {"content": [{"type": "text", "text": json.dumps(payload)}]},
             )
             return
+        if name == "get_email_by_uid_flat":
+            # Mimics real rustymail's get_email_by_uid response shape:
+            # flat dict, no "raw" field, headers as siblings.
+            uid = int(args.get("uid", 0))
+            if uid != 9001:
+                _error(req_id, -32602, f"unknown uid {uid}")
+                return
+            payload = {
+                "uid": 9001,
+                "folder_id": 1,
+                "from_address": "noreply@github.com",
+                "from_name": "GitHub",
+                "to_addresses": ["subscriber@example.com"],
+                "cc_addresses": [],
+                "subject": "PR opened",
+                "date": "2026-05-14T10:00:00Z",
+                "message_id": "<pr-1@github.com>",
+                "in_reply_to": None,
+                "references_header": "",
+                "body_text": "Hello, this is the body of a PR notification.",
+                "body_html": "<p>this is the body</p>",
+                "size": 1024,
+                "has_attachments": False,
+            }
+            _result(
+                req_id,
+                {"content": [{"type": "text", "text": json.dumps(payload)}]},
+            )
+            return
         _error(req_id, -32601, f"unknown tool {name!r}")
         return
 

@@ -146,18 +146,32 @@ def _classify_context(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     if not msg:
         raise SidecarError("bad_request", "message field is required")
 
-    # Accept either a raw RFC 5322 string OR a pre-shaped fetch-batch entry.
+    # Three input shapes are accepted:
+    # 1. {raw: "<RFC 5322>"} → parse with classification_set
+    # 2. {headers: {<canonical dict>}, body_text: ...} → use as-is
+    # 3. Rustymail flat-shape entry (from_address + from_name +
+    #    to_addresses[] + ...) → synthesize headers from the flat fields
+    #
+    # If a message LOOKS like it has both — e.g. a malformed headers
+    # field AND a flat shape — we prefer the flat shape since that's
+    # the real rustymail output most callers will pass.
     raw = msg.get("raw") or ""
-    if "headers" in msg and msg["headers"]:
-        headers = msg["headers"]
-        body_text = msg.get("body_text", "")
-    else:
-        if not raw:
-            raise SidecarError(
-                "bad_request", "message needs either 'raw' or 'headers'"
-            )
+    if raw:
         headers = classification_set(raw)
         body_text = _split_body(raw)
+    elif _looks_well_shaped_headers(msg.get("headers")):
+        headers = msg["headers"]
+        body_text = msg.get("body_text", "")
+    elif msg.get("from_address") or msg.get("to_addresses"):
+        # Rustymail flat-shape entry.
+        headers = _synthesize_headers_from_flat(msg)
+        body_text = msg.get("body_text") or ""
+    else:
+        raise SidecarError(
+            "bad_request",
+            "message needs either 'raw', 'headers' (canonical dict), "
+            "or rustymail flat fields (from_address + to_addresses)",
+        )
 
     ranking = resolve(
         from_=headers.get("from", []),
@@ -222,6 +236,10 @@ def _fetch_batch(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     max_messages = int(request.get("max_messages", 50))
     max_body_chars = int(request.get("max_body_chars", 4000))
     fetch_tool = request.get("fetch_tool", "get_email_by_uid")
+    # Real rustymail's get_email_by_uid requires account_id. Accept it
+    # at the top level so the agent doesn't have to know about the
+    # per-tool arg shape.
+    account_id = request.get("account_id")
 
     uids = [int(u) for u in uids][:max_messages]
 
@@ -236,8 +254,11 @@ def _fetch_batch(request: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
         client.open()
         for uid in uids:
             mcp_calls += 1
+            tool_args: dict[str, Any] = {"folder": folder, "uid": uid}
+            if account_id:
+                tool_args["account_id"] = account_id
             try:
-                tool_result = client.call_tool(fetch_tool, {"folder": folder, "uid": uid})
+                tool_result = client.call_tool(fetch_tool, tool_args)
             except McpClientError as e:
                 fetch_errors.append({"uid": uid, "error": str(e)})
                 continue
@@ -325,6 +346,75 @@ def _entry_addr_list(
 def _entry_size(entry: dict[str, Any]) -> int:
     """Message size in bytes, falling back across shape names."""
     return int(entry.get("size_bytes") or entry.get("size") or 0)
+
+
+def _synthesize_headers_from_flat(entry: dict[str, Any]) -> dict[str, Any]:
+    """Build the canonical headers dict (as produced by
+    :func:`lib.headers.classification_set`) from a rustymail flat-shape
+    entry — the shape returned by ``get_email_by_uid`` and
+    ``list_cached_emails``. Use when the caller has no ``raw`` field
+    available.
+
+    Falls back to ``[]`` / ``None`` for fields not present in the flat
+    shape (e.g. ``list_id``, ``list_unsubscribe`` aren't surfaced).
+    """
+    from lib.headers import parse_address_list
+
+    # From: synthesize "Name <addr>" then parse, OR build the structured
+    # form directly. The structured form is the dominant case.
+    from_list: list[dict[str, str]] = []
+    fa = entry.get("from_address") or ""
+    fn = entry.get("from_name") or ""
+    if fa and "@" in fa:
+        from_list.append({"name": fn or "", "addr": fa.lower()})
+
+    def _addr_list(field: str) -> list[dict[str, str]]:
+        raw = entry.get(field)
+        out: list[dict[str, str]] = []
+        if isinstance(raw, list):
+            for a in raw:
+                if isinstance(a, str) and "@" in a:
+                    out.append({"name": "", "addr": a.lower()})
+        elif isinstance(raw, str) and raw:
+            out = parse_address_list(raw)
+        return out
+
+    refs_raw = entry.get("references_header") or ""
+    references: list[str] = re.findall(r"<[^>]+>", refs_raw)
+
+    return {
+        "from": from_list,
+        "to": _addr_list("to_addresses"),
+        "cc": _addr_list("cc_addresses"),
+        "subject": entry.get("subject") or "",
+        "date": entry.get("date"),
+        "message_id": (entry.get("message_id") or "").strip() or None,
+        "list_id": None,
+        "list_unsubscribe": {"urls": [], "mailtos": []},
+        "list_unsubscribe_post_one_click": False,
+        "in_reply_to": (entry.get("in_reply_to") or "").strip() or None,
+        "references": references,
+        "importance": None,
+        "x_openfang_digest_id": None,
+    }
+
+
+def _looks_well_shaped_headers(h: Any) -> bool:
+    """Return True if ``h`` is a dict whose from/to/cc fields are lists
+    of ``{name, addr}`` dicts (the canonical shape). False for any other
+    shape — e.g. strings or raw RFC-822 lines."""
+    if not isinstance(h, dict):
+        return False
+    for field in ("from", "to", "cc"):
+        v = h.get(field)
+        if v is None:
+            return False
+        if not isinstance(v, list):
+            return False
+        for item in v:
+            if not (isinstance(item, dict) and "addr" in item):
+                return False
+    return True
 
 
 def _entry_from_display(entry: dict[str, Any]) -> str:
@@ -439,14 +529,30 @@ def _extract_payload(tool_result: dict[str, Any]) -> dict[str, Any]:
 def _shape_message(
     uid: int, folder: str, payload: dict[str, Any], max_body_chars: int
 ) -> dict[str, Any]:
-    """Translate one server payload into the canonical fetch-batch entry."""
+    """Translate one server payload into the canonical fetch-batch entry.
+
+    Handles two input shapes:
+    - ``payload["raw"]`` (or ``payload["rfc822"]``) — parse via
+      :func:`lib.headers.classification_set`.
+    - Rustymail's flat shape (``payload["from_address"]`` etc.) —
+      synthesize the canonical headers dict.
+    """
     from lib.body import render
     from lib.headers import classification_set
 
     raw = payload.get("raw") or payload.get("rfc822") or ""
-    headers = classification_set(raw) if raw else {}
+    if raw:
+        headers = classification_set(raw)
+        body_text_src = payload.get("body_text") or _split_body(raw)
+    elif payload.get("from_address") or payload.get("to_addresses"):
+        headers = _synthesize_headers_from_flat(payload)
+        body_text_src = payload.get("body_text") or ""
+    else:
+        headers = {}
+        body_text_src = payload.get("body_text") or ""
+
     body_part = render(
-        raw_text=payload.get("body_text") or _split_body(raw),
+        raw_text=body_text_src,
         raw_html=payload.get("body_html"),
         max_chars=max_body_chars,
     )
