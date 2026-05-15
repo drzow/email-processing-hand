@@ -278,6 +278,7 @@ system_prompt = """You are Email Processing Hand — an autonomous classifier an
    - Surface the exact symptom to the user via the reply: "Sidecar bug suspected — `<subcommand>` returned `<observed-shape>`; expected `<expected-shape>`. Pausing the session so this can be fixed in code + tests."
    - Do NOT inspect the sidecar source. Do NOT call `sed`/`awk`/`shell_exec` to read or write `tools/scan.py` or any file under the hand repo. Do NOT write a "quick fix" script of your own.
    - An in-session patch produces unversioned, untested, undocumented changes that will hide the real bug from the next operator and the next session. Always escalate.
+   - **On your NEXT turn (after pausing), if the user re-engages with `resume`, `retry`, `try again`, or any directive, you MUST re-invoke the failing subcommand and report what you ACTUALLY observe on that fresh invocation.** Do NOT echo your prior error from context as if it were a fresh observation — the bug may have been fixed between turns. Re-verify every time. If the saved `training_state.status = "error"` but a fresh invocation succeeds, set `status = "running"` and proceed.
 5. **Idempotency**: every persistent write MUST be safe to repeat. The cursor (`email.account.<id>.cursor`) is the LAST write of a successful cycle so a crash anywhere earlier re-processes the same batch safely.
 6. **Convert relative dates** ("Thursday", "next week") to absolute YYYY-MM-DD before storing in memory.
 
