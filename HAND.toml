@@ -299,14 +299,39 @@ A missing or failing MCP server logs and falls through; the affected account / f
 | You want to... | Use |
 |---|---|
 | Move one message | `mcp_rustymail_atomic_move_message(account_id, from_folder, to_folder, uid)` |
-| Move many (batched) | `mcp_rustymail_atomic_batch_move(account_id, source_folder, target_folder, uids="u1,u2,...")` |
-| Delete (permanent) | `mcp_rustymail_delete_messages(account_id, folder, uids="u1,u2,...")` |
-| Soft-delete (mark) | `mcp_rustymail_mark_as_deleted(account_id, folder, uids)` |
+| Move many (batched) | `mcp_rustymail_atomic_batch_move(account_id, from_folder, to_folder, uids=[1,2,...])` |
+| Delete (permanent) | `mcp_rustymail_delete_messages(account_id, folder, uids=[1,2,...])` |
+| Soft-delete (mark) | `mcp_rustymail_mark_as_deleted(account_id, folder, uids=[1,2,...])` |
 | Find by sender (domain) | `mcp_rustymail_search_by_domain(account_id, domain)` |
 | Find by sender (exact) | `mcp_rustymail_search_cached_emails(account_id, query="from:X@Y")` |
 | Create a folder | `mcp_rustymail_create_folder` (if available; otherwise the first `atomic_move_message` to a non-existent folder will create it) |
 
-Note the parameter name `from_folder` for `atomic_move_message` (NOT `source_folder` — that's `atomic_batch_move`'s).
+### ⚠ Schema vs. binary disagreement (LIVE-VERIFIED 2026-05-20)
+
+The rustymail MCP server's schema declarations DO NOT match what the
+binary actually accepts. Verified by direct probe — every mutation
+tool. Use the ACTUAL shapes:
+
+| Tool | `uids` actual | folder params actual |
+|---|---|---|
+| `atomic_batch_move` | JSON array `[1,2,3]` (schema lies, says CSV) | `from_folder` + `to_folder` (schema lies, says source/target_folder) |
+| `atomic_move_message` | n/a (single `uid` integer) | `from_folder` + `to_folder` (schema lies, says source/target_folder) |
+| `delete_messages` | JSON array `[1,2,3]` (schema lies) | `folder` (singular — correct in schema) |
+| `mark_as_deleted` | JSON array `[1,2,3]` (schema lies) | `folder` (singular — correct in schema) |
+
+If you pass `uids="1,2,3"` as a CSV string, the binary replies
+`"Missing 'uids' parameter"` — confusingly, because the param IS
+present, just rejected by the type check. Use a JSON array.
+
+### ⚠ `delete_messages.count` is misleading
+
+The response `{"count": N, "folder": ..., "uids": [...]}` reports
+the count of UIDs SUBMITTED, not the count actually deleted. Calling
+`delete_messages` with 378 non-existent UIDs returns `count: 378`
+and looks like success. To confirm actual deletion: call
+`get_folder_stats` before and after and diff, OR `search_by_domain`
+afterward to confirm matching messages are gone. Never trust the
+`count` field as a verification signal.
 
 **If a tool seems missing**, the answer is to check `tools/list` against the live server, NOT to assume the tool isn't available and stage a "would-have-moved" or "would-have-deleted" message. The set of exposed tools depends on which rustymail stdio variant openfang is configured with (low-level exposes mutation tools; high-level omits them). At time of this prompt, openfang is configured for **low-level**, so the table above is accurate. If you ever see "unavailable in this build" coming out of your reasoning, run a fresh `tools/list` first — the proxy may have been reconfigured.
 
@@ -318,7 +343,7 @@ For **rustymail** (IMAP fetch / search / move / delete / Sieve):
 ```json
 "mcp_server": {
   "command": [
-    "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio-high-level",
+    "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio",
     "--backend-url", "http://localhost:9437/mcp"
   ]
 }
@@ -388,7 +413,7 @@ For each account in `accounts`:
    ```json
    {
      "mcp_server": {"command": [
-       "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio-high-level",
+       "/home/zow/projects/rustymail/target/release/rustymail-mcp-stdio",
        "--backend-url", "http://localhost:9437/mcp"
      ]},
      "selector": {"kind": "uids", "uids": [<UIDs since cursor>], "folder": "INBOX"},
@@ -544,8 +569,8 @@ Bucket 11 (RespondUrgent) and Bucket 12 (Action) are EXCEPTIONS — they still s
 
 ### 2. UnsubAndBlock
 - Heuristic: clean mass-mail pattern (List-Id present, sender role = `marketing@`/`noreply@`) → domain-scoped rule.
-- shell_exec `submit-unsubscribe` (NOT YET IMPLEMENTED — log "WOULD submit RFC 8058 unsubscribe" for now).
-- shell_exec `prepare-bulk-delete` for past messages within `unsubscribe_lookback_months`; same confirm-then-delete flow as Bucket 1.
+- shell_exec `submit-unsubscribe` — fully implemented (RFC 8058 POST, GET fallback, body-HTML scrape, mailto fallback). See the detailed Bucket 2 flow lower down — that's the canonical algorithm. The two-line outline here is for quick reference only.
+- shell_exec `prepare-bulk-delete` with `bulk_only: true` to find ALL bulk mail from sender (unbounded in time — see Bucket 2 detailed flow). Confirm-then-delete pattern matches Bucket 1.
 
 ### 3. Filter
 - Ask user (dashboard chat): "File from <sender> to which folder?" with tab-completion of existing folders (fetched via MCP `list_folders_hierarchical`).
@@ -861,7 +886,7 @@ For each bucket, the concrete tool calls are below. After execution: update `tra
    - `domain = domain_of(sender)`
    - For each account_id: call MCP `search_by_domain(account_id, domain, search_in=["from"], limit=5000)`. Filter results to exact From: matches if rule_scope is `sender` (the search is domain-wide).
 2. Group matches by folder.
-3. For each folder with matches: MCP `delete_messages(account_id, folder, uids="u1,u2,...")`.
+3. For each folder with matches: MCP `delete_messages(account_id, folder, uids=[1,2,...])`. (uids MUST be a JSON array of integers — see schema-vs-binary table above. Verify via folder-stats diff, NOT the returned `count`.)
 4. Upsert deterministic rule into `sender_rules` keyed by `(scope, value)`. Set `bucket = "Blacklist"`.
 5. Flag Sieve regen needed.
 6. totals: `messages_deleted += N`, `rules_learned += 1` (if new rule).
@@ -935,7 +960,7 @@ confirmations, support replies from the same address).
    second search if needed):
    ```
    for (folder, uids) in by_folder(bulk_uids):
-       mcp_rustymail_delete_messages(account_id=<acct>, folder=<folder>, uids="<csv>")
+       mcp_rustymail_delete_messages(account_id=<acct>, folder=<folder>, uids=[<int>, <int>, ...])
    ```
    ⚠ **`delete_messages` IS an exposed rustymail MCP tool.** You
    verified it earlier in this same session. If you find yourself
@@ -958,7 +983,8 @@ confirmations, support replies from the same address).
 1. From the proposal's `options.folder` (or ask the user: "Which folder? (existing: <list>)" via dashboard chat if the classifier didn't supply one).
 2. For each account_id and each folder in workflow's `scope_folders`:
    - Find UIDs matching the sender via `search_by_domain` (filter to exact sender).
-   - MCP `atomic_batch_move(account_id, source_folder, target_folder=<chosen>, uids="...")`.
+   - **First call `mcp_rustymail_create_folder(account_id, folder_name=<chosen>)` if the target folder doesn't already exist.** atomic_batch_move's auto-create promise from the schema is unreliable.
+   - MCP `atomic_batch_move(account_id, from_folder=<scope_folder>, to_folder=<chosen>, uids=[<int>, ...])`.
 3. Upsert deterministic rule with `bucket = "Filter"`, `options.folder`.
 4. Flag Sieve regen.
 5. totals: `messages_moved += N`, `rules_learned += 1`.
@@ -1053,12 +1079,13 @@ Only reached when the user has typed `commit session rules` or `commit session r
 2. For each entry in `training_state.pending_rules`: upsert into the sender_rules list keyed by `(scope, value, kind)`. Set `confirmed_count = 1`, `corrected_count = 1 if user_response == "corrected" else 0`.
 3. memory_store `email.account.<id>.sender_rules` with the merged list.
 4. If commit was `no-sieve` OR `sieve_enabled = false` OR the account is non-IMAP: skip Sieve regen, jump to step 9.
-5. shell_exec `python3 -c "import sys, json; from lib.sieve import build_with_summary; body, summary = build_with_summary(json.load(sys.stdin)['rules']); print(json.dumps({'body': body, 'summary': summary}))"` with the merged rules on stdin.
-6. MCP `sieve_check_script(body=<body>)`. If validation fails, do NOT push; surface the error and STOP (do not call sieve_set_active). The rules are still persisted in memory; the user can fix and retry.
-7. MCP `sieve_put_script(name="openfang-managed.sieve", body=<body>)`.
-8. MCP `sieve_set_active(name="openfang-managed.sieve")`.
-9. memory_store `email.account.<id>.sieve_state` (or skip if step 4 jumped here).
-10. Clear `training_state.pending_rules`, set `status = "committed"`. Report counts to user.
+5. **Pre-create every fileinto destination folder.** For every `Filter` rule whose `options.folder` references a folder that doesn't already exist on the server, call `mcp_rustymail_create_folder(account_id, folder_name=<options.folder>)` first. A Sieve `fileinto "X"` on a missing folder dovecot-server-side either drops the mail or leaves it in INBOX (server-dependent), so we don't activate a script that references a non-existent destination. List existing folders via `mcp_rustymail_list_folders_hierarchical` and diff against the rule set.
+6. shell_exec `python3 -c "import sys, json; from lib.sieve import build_with_summary; body, summary = build_with_summary(json.load(sys.stdin)['rules']); print(json.dumps({'body': body, 'summary': summary}))"` with the merged rules on stdin.
+7. MCP `sieve_check_script(body=<body>)`. If validation fails, do NOT push; surface the error and STOP (do not call sieve_set_active). The rules are still persisted in memory; the user can fix and retry.
+8. MCP `sieve_put_script(name="openfang-managed.sieve", body=<body>)`.
+9. MCP `sieve_set_active(name="openfang-managed.sieve")`.
+10. memory_store `email.account.<id>.sieve_state` (or skip if step 4 jumped here).
+11. Clear `training_state.pending_rules`, set `status = "committed"`. Report counts to user.
 
 ### training_lock — coordinate with incremental cycles
 
